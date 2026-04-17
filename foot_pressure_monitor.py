@@ -32,8 +32,19 @@ import socket
 import sys
 import time
 import traceback
+import warnings
 from collections import deque
 from typing import Optional, Tuple
+
+# sklearn 的模型是用 1.5.1 训的，这边环境是 1.8.0，跨版本 unpickle
+# 会对每个 estimator 都刷一条 InconsistentVersionWarning。
+# 模型我试过跑起来没问题，警告只是刷屏，而且会把控制台拖慢，直接关掉。
+warnings.filterwarnings("ignore", category=UserWarning, module=r"sklearn\..*")
+try:
+    from sklearn.exceptions import InconsistentVersionWarning
+    warnings.filterwarnings("ignore", category=InconsistentVersionWarning)
+except Exception:
+    pass
 
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtGui import QBrush, QColor, QFont, QPainter
@@ -312,7 +323,11 @@ class StatusDot(QWidget):
 
 
 class ChannelReadout(QLabel):
-    """Single-channel live ADC readout — raw + pressure percent, updated via ``set_raw``."""
+    """单通道实时 ADC 读数 — 标题 + raw 值 + 百分比。
+
+    之前是用富文本 HTML 刷，每帧 8 个 label 解析 <span> 很卡主线程；
+    现在改成纯文本三行 + 一次性 setStyleSheet，快得多而且视觉上一致。
+    """
 
     def __init__(self, title: str, accent: str, is_knee: bool = False, parent=None):
         super().__init__(parent)
@@ -320,41 +335,32 @@ class ChannelReadout(QLabel):
         self._accent = accent
         self._is_knee = is_knee
         self.setAlignment(Qt.AlignCenter)
-        self.setTextFormat(Qt.RichText)
+        self.setTextFormat(Qt.PlainText)
         self.setMinimumWidth(110)
+        # 样式只设一次，以后只改文本，避免每帧重新解析 stylesheet
+        self.setStyleSheet(
+            "color:#ffffff; font-size:13px; font-weight:bold; line-height:115%;"
+        )
+        # 用一个小状态缓存，避免文本没变也 setText（QLabel 会触发 relayout）
+        self._last_text: Optional[str] = None
         self.set_raw(None)
 
     def set_raw(self, raw: Optional[float]):
         if raw is None:
-            body = "<span style='color:#606080;font-size:24px;font-weight:bold;'>—</span>"
-            pct = "<span style='color:#404060;font-size:10px;'>no data</span>"
+            text = f"{self._title}\n—\nno data"
         else:
             raw_i = int(round(float(raw)))
-            body = (
-                f"<span style='color:#ffffff;font-size:24px;font-weight:bold;'>"
-                f"{raw_i}</span>"
-            )
             if self._is_knee:
-                # Knee: lower raw = more bent; 4095 = straight
+                # 膝盖：raw 越小弯得越厉害，4095 = 直
                 bend = max(0.0, (SENSOR_MAX - raw)) / SENSOR_MAX * 100.0
-                tag_clr = "#69db7c" if bend < 3 else "#ffd43b" if bend < 25 else "#ff6b6b"
-                pct = (
-                    f"<span style='color:{tag_clr};font-size:10px;'>"
-                    f"bend {bend:4.0f}%</span>"
-                )
+                tag = f"bend {bend:4.0f}%"
             else:
                 load = max(0.0, (SENSOR_MAX - raw)) / SENSOR_MAX * 100.0
-                tag_clr = "#44dd66" if load < 40 else "#ffaa00" if load < 70 else "#ff4444"
-                pct = (
-                    f"<span style='color:{tag_clr};font-size:10px;'>"
-                    f"load {load:4.0f}%</span>"
-                )
-        self.setText(
-            f"<div style='line-height:115%;'>"
-            f"<span style='color:{self._accent};font-size:11px;font-weight:bold;'>"
-            f"{self._title}</span><br>{body}<br>{pct}"
-            f"</div>"
-        )
+                tag = f"load {load:4.0f}%"
+            text = f"{self._title}\n{raw_i}\n{tag}"
+        if text != self._last_text:
+            self._last_text = text
+            self.setText(text)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -971,8 +977,18 @@ class MainWindow(QMainWindow):
         self._csv_raw_path = ""
 
         self._data_n = 0
+        # 攒够这么多行再 flush 一次，避免每帧都 IO。
+        # 10Hz 下 20 行差不多 2 秒，崩了最多丢 2 秒录制。
+        self._csv_flush_every = 20
+        self._csv_since_flush = 0
         self.current_label = "UNKNOWN"
         self.recognizer = OnlineRecognizer()
+
+        # UI 节流：识别器每帧都跑（状态机需要），但 UI 文字没必要 10–20Hz 刷。
+        # 至少隔这么久才允许刷新一次 HUD / 通道读数 / 流元信息。
+        self._ui_refresh_min_interval = 0.20  # 秒，也就是 ~5 Hz
+        self._last_ui_refresh_t = 0.0
+        self._last_hud_state = None  # 状态真的变了就立刻刷，不等节流
 
         # Latest synced frame for each foot
         self._last_left: Optional[FootFour] = None
@@ -1391,11 +1407,27 @@ class MainWindow(QMainWindow):
                     if self.calib_panel is not None:
                         self.calib_panel.set_live_state(True)
                 self._append_csv_synced(ts_avg_mcu, l4, r4)
-                self._update_live_readouts(l4, r4)
+                # 标定面板内部有自己的累计/判定，必须每帧喂，不能节流
                 if self.calib_panel is not None:
                     self.calib_panel.feed(l4, r4)
-                self._run_recognizer_and_hud()
-                self._refresh_stream_meta()
+                # 识别器同样每帧都要跑，状态机 / 防抖计数都靠时间连续
+                hud_out = self._run_recognizer(l4, r4)
+                # 真正刷 UI 的部分做节流：到时间 or 状态变了才更新
+                now = time.monotonic()
+                state_changed = (
+                    hud_out is not None
+                    and hud_out["state"] != self._last_hud_state
+                )
+                if (
+                    state_changed
+                    or (now - self._last_ui_refresh_t) >= self._ui_refresh_min_interval
+                ):
+                    self._last_ui_refresh_t = now
+                    self._update_live_readouts(l4, r4)
+                    if hud_out is not None:
+                        self._update_hud(hud_out)
+                        self._last_hud_state = hud_out["state"]
+                    self._refresh_stream_meta()
         except Exception as exc:  # noqa: BLE001
             self.statusBar().showMessage(f"data error: {exc}")
             traceback.print_exc()
@@ -1416,10 +1448,14 @@ class MainWindow(QMainWindow):
         ]
         self._csv_writer_labeled.writerow([*row8, self.current_label])
         self._csv_writer_raw.writerow(row8)
-        if self._csv_labeled_f:
-            self._csv_labeled_f.flush()
-        if self._csv_raw_f:
-            self._csv_raw_f.flush()
+        # 每帧 flush 太卡主线程，攒一批一起刷。closeEvent 关文件时也会自动刷。
+        self._csv_since_flush += 1
+        if self._csv_since_flush >= self._csv_flush_every:
+            self._csv_since_flush = 0
+            if self._csv_labeled_f:
+                self._csv_labeled_f.flush()
+            if self._csv_raw_f:
+                self._csv_raw_f.flush()
 
     def _update_live_readouts(
         self,
@@ -1446,18 +1482,20 @@ class MainWindow(QMainWindow):
         )
 
     # ── recognizer / HUD ────────────────────────────────────────
-    def _run_recognizer_and_hud(self):
-        l4 = foot_tuple_for_recognizer(self._last_left)
-        r4 = foot_tuple_for_recognizer(self._last_right)
+    def _run_recognizer(self, l4_raw, r4_raw):
+        """每帧都要调：喂给识别器并返回它的输出（不碰 UI）。"""
+        l4 = foot_tuple_for_recognizer(l4_raw)
+        r4 = foot_tuple_for_recognizer(r4_raw)
         if l4 is not None and r4 is not None:
-            out = self.recognizer.update_bilateral(l4, r4)
-        elif l4 is not None:
-            out = self.recognizer.update(*l4)
-        elif r4 is not None:
-            out = self.recognizer.update(*r4)
-        else:
-            return
+            return self.recognizer.update_bilateral(l4, r4)
+        if l4 is not None:
+            return self.recognizer.update(*l4)
+        if r4 is not None:
+            return self.recognizer.update(*r4)
+        return None
 
+    def _update_hud(self, out: dict):
+        """只刷 HUD 的五个大 label；被节流调度，不用每帧调。"""
         state = out["state"]
         counters = out["counters"]
         debug = out.get("debug", {})
