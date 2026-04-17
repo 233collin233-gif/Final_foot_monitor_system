@@ -48,6 +48,8 @@ from PyQt5.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QScrollArea,
+    QSizePolicy,
     QTabWidget,
     QTextEdit,
     QVBoxLayout,
@@ -362,12 +364,27 @@ class ChannelReadout(QLabel):
 class CalibrationPanel(QWidget):
     """Embedded two-step personal-calibration wizard.
 
-    On **Save** a ``personal_calibration.json`` is written to the project root
-    and :class:`MainWindow` hot-reloads its :class:`OnlineRecognizer` so the
-    new per-wearer range takes effect immediately.
+    Layout fix
+    ----------
+    The panel's content lives inside a :class:`QScrollArea` so no button
+    is ever clipped, regardless of the host window's height or Windows
+    display scaling (100% / 125% / 150%).  The outer panel itself has
+    an Expanding size policy so the parent tab widget can give it the
+    remaining vertical space.
 
-    The Layer-1 knee 4095 rule is still applied to the *pre*-calibration raw
-    ADC inside the recognizer; calibration only changes the ML feature scale.
+    Live-data guard
+    ---------------
+    ``Start Step 1 / Step 2`` are blocked unless :meth:`set_live_state`
+    has been called with ``True`` (i.e. MainWindow confirmed at least
+    one synced bilateral frame arrived).  Feeding the :class:`OnlineCalibrator`
+    is also a no-op while ``self._live_ok`` is ``False`` — the progress bar
+    can never fake-advance.
+
+    On **Save** a ``personal_calibration.json`` is written to the project
+    root and :class:`MainWindow` hot-reloads its :class:`OnlineRecognizer`
+    so the new per-wearer range takes effect immediately.  The Layer-1 knee
+    4095 rule is still applied to the *pre*-calibration raw ADC inside the
+    recognizer; calibration only changes the ML feature scale.
     """
 
     STEP1_SECONDS = 5.0
@@ -383,14 +400,58 @@ class CalibrationPanel(QWidget):
         super().__init__(parent)
         self._calibrator: Optional[personal_calib.OnlineCalibrator] = None
         self._last_preview: Optional[personal_calib.PersonalCalibration] = None
+        self._live_ok: bool = False        # set via set_live_state()
+        self._step_ready_notified: set[str] = set()
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self._build_ui()
+        self._apply_initial_button_state()
         self._refresh_existing_calibration_status()
 
+    # ═══════════════════ UI CONSTRUCTION ════════════════════════════
     def _build_ui(self):
-        root = QVBoxLayout(self)
-        root.setContentsMargins(14, 10, 14, 10)
+        # Outer layout holds ONE widget: a QScrollArea with the real
+        # content inside.  This is what keeps every button visible even
+        # on 125–150% Windows display scaling and short windows.
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        self._scroll = QScrollArea(self)
+        self._scroll.setFrameShape(QFrame.NoFrame)
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self._scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self._scroll.setStyleSheet(
+            "QScrollArea { background:transparent; border:none; }"
+            "QScrollBar:vertical { background:#10102a; width:10px; }"
+            "QScrollBar::handle:vertical { background:#3a3a5a; border-radius:5px; }"
+            "QScrollBar::add-line, QScrollBar::sub-line { height:0; }"
+        )
+        outer.addWidget(self._scroll)
+
+        content = QWidget()
+        content.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
+        self._scroll.setWidget(content)
+
+        root = QVBoxLayout(content)
+        root.setContentsMargins(14, 10, 14, 14)
         root.setSpacing(10)
 
+        # ── usage-order banner (bright, so users can't miss it) ───────
+        banner = QLabel(
+            "Usage order:  connect both MCUs → click top-right <b>Start</b> → "
+            "wait until live bilateral packets arrive → open Calibration → "
+            "Step 1 → Step 2 → Save"
+        )
+        banner.setTextFormat(Qt.RichText)
+        banner.setWordWrap(True)
+        banner.setStyleSheet(
+            "QLabel{background:#241830;border:1px solid #ff9060;border-radius:6px;"
+            "color:#ffd0a0;font-size:12px;padding:8px 10px;}"
+        )
+        root.addWidget(banner)
+
+        # ── per-wearer intro (what the wizard does) ───────────────────
         header = QLabel(
             "Personal calibration wizard — aligns per-channel [min, max] ADC to this "
             "wearer.  Layer-1 knee 4095 rule is unaffected; only ML feature scale changes."
@@ -399,45 +460,69 @@ class CalibrationPanel(QWidget):
         header.setStyleSheet("color:#d0d0e0; font-size:12px;")
         root.addWidget(header)
 
+        # ── existing-calibration status line ──────────────────────────
         self.status_lbl = QLabel("—")
         self.status_lbl.setWordWrap(True)
         self.status_lbl.setStyleSheet("color:#9090b0; font-size:11px;")
         root.addWidget(self.status_lbl)
 
+        # ── live-data indicator line (flips when MainWindow notifies) ──
+        self.live_lbl = QLabel(
+            "Live data: NO.  Press Start on the top bar and wait for packets."
+        )
+        self.live_lbl.setStyleSheet(
+            "color:#ff8080; background:#1a0a14; border:1px solid #602030;"
+            "border-radius:5px; padding:4px 8px; font-size:11px;"
+        )
+        self.live_lbl.setWordWrap(True)
+        root.addWidget(self.live_lbl)
+
+        # ── subject row ───────────────────────────────────────────────
         subj_row = QHBoxLayout()
         subj_row.addWidget(self._small("Subject:"))
         self.subject_in = QLineEdit("default")
-        self.subject_in.setFixedWidth(180)
+        self.subject_in.setFixedWidth(200)
         subj_row.addWidget(self.subject_in)
         subj_row.addStretch()
         root.addLayout(subj_row)
 
-        # Step 1 card
+        # ── Step 1 card ───────────────────────────────────────────────
         step1_box = self._card(
             title="Step 1 — Stand still (capture personal pressure range)",
             title_color="#ff9060",
             desc=(
                 "Have the wearer stand naturally upright, weight on both feet. "
-                f"Hold ~{self.STEP1_SECONDS:.0f} s.  The lowest ADC values seen here "
-                "become each pressure pad's personal \"fully loaded\" reference."
+                f"Hold ~{self.STEP1_SECONDS:.0f} s.  The lowest ADC values seen "
+                "here become each pressure pad's personal \"fully loaded\" reference."
             ),
         )
         s1 = step1_box.layout()
         row1 = QHBoxLayout()
+        row1.setSpacing(10)
         self.s1_start_btn = QPushButton("Start Step 1")
+        self.s1_start_btn.setCursor(Qt.PointingHandCursor)
         self.s1_start_btn.clicked.connect(self._start_step1)
         self.s1_finish_btn = QPushButton("Finish Step 1")
-        self.s1_finish_btn.setEnabled(False)
+        self.s1_finish_btn.setCursor(Qt.PointingHandCursor)
         self.s1_finish_btn.clicked.connect(self._finish_step1)
         row1.addWidget(self.s1_start_btn)
         row1.addWidget(self.s1_finish_btn)
         row1.addStretch()
         s1.addLayout(row1)
-        self.s1_progress = QProgressBar(); self.s1_progress.setRange(0, 100)
+
+        self.s1_progress = QProgressBar()
+        self.s1_progress.setRange(0, 100)
+        self.s1_progress.setTextVisible(True)
+        self.s1_progress.setFormat("%p%")
+        self.s1_progress.setMinimumHeight(18)
         s1.addWidget(self.s1_progress)
+
+        self.s1_count_lbl = QLabel("frames captured: 0 / 0")
+        self.s1_count_lbl.setStyleSheet("color:#a0a0c0; font-size:11px;")
+        s1.addWidget(self.s1_count_lbl)
         root.addWidget(step1_box)
 
-        # Step 2 card
+        # ── Step 2 card ───────────────────────────────────────────────
         step2_box = self._card(
             title="Step 2 — Bend knee ~90° (capture personal stretch range)",
             title_color="#60c0ff",
@@ -449,55 +534,102 @@ class CalibrationPanel(QWidget):
         )
         s2 = step2_box.layout()
         row2 = QHBoxLayout()
+        row2.setSpacing(10)
         self.s2_start_btn = QPushButton("Start Step 2")
-        self.s2_start_btn.setEnabled(False)
+        self.s2_start_btn.setCursor(Qt.PointingHandCursor)
         self.s2_start_btn.clicked.connect(self._start_step2)
         self.s2_finish_btn = QPushButton("Finish Step 2")
-        self.s2_finish_btn.setEnabled(False)
+        self.s2_finish_btn.setCursor(Qt.PointingHandCursor)
         self.s2_finish_btn.clicked.connect(self._finish_step2)
         row2.addWidget(self.s2_start_btn)
         row2.addWidget(self.s2_finish_btn)
         row2.addStretch()
         s2.addLayout(row2)
-        self.s2_progress = QProgressBar(); self.s2_progress.setRange(0, 100)
+
+        self.s2_progress = QProgressBar()
+        self.s2_progress.setRange(0, 100)
+        self.s2_progress.setTextVisible(True)
+        self.s2_progress.setFormat("%p%")
+        self.s2_progress.setMinimumHeight(18)
         s2.addWidget(self.s2_progress)
+
+        self.s2_count_lbl = QLabel("frames captured: 0 / 0")
+        self.s2_count_lbl.setStyleSheet("color:#a0a0c0; font-size:11px;")
+        s2.addWidget(self.s2_count_lbl)
         root.addWidget(step2_box)
 
+        # ── save + reset row ──────────────────────────────────────────
         save_row = QHBoxLayout()
+        save_row.setSpacing(10)
         self.save_btn = QPushButton("Save personal_calibration.json + reload")
-        self.save_btn.setEnabled(False)
+        self.save_btn.setCursor(Qt.PointingHandCursor)
         self.save_btn.clicked.connect(self._save)
         self.reset_btn = QPushButton("Reset wizard")
+        self.reset_btn.setObjectName("stopBtn")
+        self.reset_btn.setCursor(Qt.PointingHandCursor)
         self.reset_btn.clicked.connect(self._reset)
         save_row.addWidget(self.save_btn)
         save_row.addWidget(self.reset_btn)
         save_row.addStretch()
         root.addLayout(save_row)
 
-        self.preview = QTextEdit(); self.preview.setReadOnly(True)
+        # ── log text box (events / errors) — small fixed height ──────
+        log_hdr = QLabel("Log")
+        log_hdr.setStyleSheet(
+            "color:#a0a0c0;font-size:11px;font-weight:bold;margin-top:4px;"
+        )
+        root.addWidget(log_hdr)
+
+        self.log = QTextEdit()
+        self.log.setReadOnly(True)
+        self.log.setMinimumHeight(90)
+        self.log.setMaximumHeight(140)
+        self.log.setStyleSheet(
+            "QTextEdit{background:#0a0a1a;color:#c0d0ff;"
+            "font-family:'Consolas','Courier New',monospace;font-size:11px;"
+            "border:1px solid #1c1c3a;border-radius:6px;}"
+        )
+        root.addWidget(self.log)
+
+        # ── calibration summary preview (bigger, monospace, scrollable) ─
+        preview_hdr = QLabel("Calibration summary (populated after Finish Step 2)")
+        preview_hdr.setStyleSheet(
+            "color:#a0a0c0;font-size:11px;font-weight:bold;margin-top:4px;"
+        )
+        root.addWidget(preview_hdr)
+
+        self.preview = QTextEdit()
+        self.preview.setReadOnly(True)
+        self.preview.setMinimumHeight(180)
         self.preview.setStyleSheet(
             "QTextEdit{background:#0a0a1a;color:#a0ffa0;"
             "font-family:'Consolas','Courier New',monospace;font-size:11px;"
             "border:1px solid #1c1c3a;border-radius:6px;}"
         )
-        self.preview.setMinimumHeight(160)
-        root.addWidget(self.preview, stretch=1)
+        root.addWidget(self.preview)
+
+        # Trailing stretch: lets the scroll area show the last widgets
+        # fully without them being forced to fill all vertical space.
+        root.addStretch(0)
 
     @staticmethod
     def _card(title: str, title_color: str, desc: str) -> QFrame:
-        box = QFrame(); box.setObjectName("card")
+        box = QFrame()
+        box.setObjectName("card")
         box.setStyleSheet(
             "#card{background:#12122a;border:1px solid #28284e;border-radius:8px;}"
         )
+        box.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
         lay = QVBoxLayout(box)
-        lay.setContentsMargins(12, 8, 12, 8)
+        lay.setContentsMargins(12, 10, 12, 10)
         lay.setSpacing(6)
         t = QLabel(title)
         t.setStyleSheet(
             f"color:{title_color};font-size:13px;font-weight:bold;"
         )
         lay.addWidget(t)
-        d = QLabel(desc); d.setWordWrap(True)
+        d = QLabel(desc)
+        d.setWordWrap(True)
         d.setStyleSheet("color:#9090b0;font-size:11px;")
         lay.addWidget(d)
         return box
@@ -508,10 +640,10 @@ class CalibrationPanel(QWidget):
         lbl.setStyleSheet("color:#707090; font-size:11px;")
         return lbl
 
-    # ── public API called by MainWindow ────────────────────────────
+    # ═══════════════════ PUBLIC API (MainWindow) ═══════════════════════
     def feed(self, raw_l: tuple, raw_r: tuple) -> None:
-        """Push one synced bilateral frame to the active calibration phase, if any."""
-        if self._calibrator is None:
+        """Push one synced bilateral frame to the active phase, if any."""
+        if self._calibrator is None or not self._live_ok:
             return
         phase = self._calibrator.phase
         if phase not in ("STEP1_STANDING", "STEP2_KNEE_BEND"):
@@ -522,83 +654,162 @@ class CalibrationPanel(QWidget):
             float(raw_l[0]), float(raw_l[1]), float(raw_l[2]), float(raw_l[3]),
             float(raw_r[0]), float(raw_r[1]), float(raw_r[2]), float(raw_r[3]),
         ]
-        progress = self._calibrator.feed(raw8)
-        bar = self.s1_progress if phase == "STEP1_STANDING" else self.s2_progress
-        bar.setValue(int(round(progress * 100)))
+        self._calibrator.feed(raw8)
+        self._refresh_progress_labels()
+        # Auto-enable Finish when the target is hit, and log once.
         if phase == "STEP1_STANDING" and self._calibrator.step1_ready:
             self.s1_finish_btn.setEnabled(True)
+            if "step1" not in self._step_ready_notified:
+                self._step_ready_notified.add("step1")
+                self._log("Step 1 ready — target frames reached.  "
+                          "You can press Finish Step 1 now.")
         if phase == "STEP2_KNEE_BEND" and self._calibrator.step2_ready:
             self.s2_finish_btn.setEnabled(True)
+            if "step2" not in self._step_ready_notified:
+                self._step_ready_notified.add("step2")
+                self._log("Step 2 ready — target frames reached.  "
+                          "You can press Finish Step 2 now.")
 
-    # ── wizard actions ────────────────────────────────────────────
+    def set_live_state(self, is_live: bool) -> None:
+        """Called by MainWindow when bilateral live packets start / stop."""
+        self._live_ok = bool(is_live)
+        if self._live_ok:
+            self.live_lbl.setText(
+                "Live data: YES — bilateral packets arriving."
+            )
+            self.live_lbl.setStyleSheet(
+                "color:#a0ffa0; background:#0a1a14; border:1px solid #306040;"
+                "border-radius:5px; padding:4px 8px; font-size:11px;"
+            )
+        else:
+            self.live_lbl.setText(
+                "Live data: NO.  Press Start on the top bar and wait for packets."
+            )
+            self.live_lbl.setStyleSheet(
+                "color:#ff8080; background:#1a0a14; border:1px solid #602030;"
+                "border-radius:5px; padding:4px 8px; font-size:11px;"
+            )
+
+    # ═══════════════════ WIZARD ACTIONS ════════════════════════════════
     def _start_step1(self):
+        if not self._live_ok:
+            self._warn_no_live()
+            return
+        self._step_ready_notified.clear()
         self._calibrator = personal_calib.OnlineCalibrator(
             sample_hz=10,
             step1_seconds=self.STEP1_SECONDS,
             step2_seconds=self.STEP2_SECONDS,
         )
-        self._calibrator.start_step1()
+        try:
+            self._calibrator.start_step1()
+        except RuntimeError as exc:
+            self._error("Step 1", str(exc))
+            return
         self.s1_progress.setValue(0)
+        self.s2_progress.setValue(0)
         self.s1_start_btn.setEnabled(False)
-        self.s1_finish_btn.setEnabled(False)
+        self.s1_finish_btn.setEnabled(False)   # enabled once min_samples reached
         self.s2_start_btn.setEnabled(False)
+        self.s2_finish_btn.setEnabled(False)
         self.save_btn.setEnabled(False)
         self.status_lbl.setText(
-            "Capturing Step 1 — stand still.  Make sure MCU stream is running."
+            "Capturing Step 1 — stand still.  Progress updates on every synced frame."
         )
+        self._refresh_progress_labels()
+        self._log("Step 1 started.")
 
     def _finish_step1(self):
+        if self._calibrator is None:
+            return
         try:
             self._calibrator.finish_step1()
         except RuntimeError as exc:
-            QMessageBox.warning(self, "Step 1", str(exc))
+            self._error("Step 1", str(exc))
             return
         self.s1_progress.setValue(100)
         self.s1_finish_btn.setEnabled(False)
+        self.s1_start_btn.setEnabled(False)
         self.s2_start_btn.setEnabled(True)
+        self.s2_finish_btn.setEnabled(False)
         self.status_lbl.setText(
             "Step 1 done — ask wearer to bend knee ~90° and press Start Step 2."
         )
+        self._log(f"Step 1 finished "
+                  f"({self._calibrator.step1_sample_count} frames captured).")
 
     def _start_step2(self):
         if self._calibrator is None:
+            self._error("Step 2", "Please complete Step 1 first.")
             return
-        self._calibrator.start_step2()
+        if self._calibrator.phase != "STEP1_DONE":
+            self._error(
+                "Step 2",
+                "Step 1 has not been finished yet — press Finish Step 1 first.",
+            )
+            return
+        if not self._live_ok:
+            self._warn_no_live()
+            return
+        try:
+            self._calibrator.start_step2()
+        except RuntimeError as exc:
+            self._error("Step 2", str(exc))
+            return
         self.s2_progress.setValue(0)
         self.s2_start_btn.setEnabled(False)
-        self.s2_finish_btn.setEnabled(False)
+        self.s2_finish_btn.setEnabled(False)   # enabled once min_samples reached
         self.status_lbl.setText("Capturing Step 2 — hold knee bent ~90°.")
+        self._refresh_progress_labels()
+        self._log("Step 2 started.")
 
     def _finish_step2(self):
+        if self._calibrator is None:
+            return
         try:
             self._calibrator.finish_step2()
         except RuntimeError as exc:
-            QMessageBox.warning(self, "Step 2", str(exc))
+            self._error("Step 2", str(exc))
             return
         self.s2_progress.setValue(100)
         self.s2_finish_btn.setEnabled(False)
+        self.s2_start_btn.setEnabled(False)
+
+        subject = self.subject_in.text().strip() or "default"
+        if not self.subject_in.text().strip():
+            self.subject_in.setText(subject)   # persist auto-fill to UI
         try:
-            self._last_preview = self._calibrator.finalize(
-                subject=self.subject_in.text().strip() or "default",
-            )
+            self._last_preview = self._calibrator.finalize(subject=subject)
         except RuntimeError as exc:
-            QMessageBox.warning(self, "Finalize", str(exc))
+            self._error("Finalize", str(exc))
             return
+
         self.preview.setPlainText(self._last_preview.summary())
         self.save_btn.setEnabled(True)
         self.status_lbl.setText(
             "Calibration ready — review min/max above, then click Save."
         )
+        self._log(f"Step 2 finished "
+                  f"({self._calibrator.step2_sample_count} frames captured). "
+                  f"Subject = {subject!r}.  Click Save to persist + reload.")
 
     def _save(self):
         if self._last_preview is None:
+            self._error("Save", "Nothing to save — finish Step 2 first.")
             return
-        abs_path = self._last_preview.save_json(self.JSON_PATH)
+        try:
+            abs_path = self._last_preview.save_json(self.JSON_PATH)
+        except Exception as exc:  # noqa: BLE001
+            self._error("Save", f"Could not write JSON: {exc}")
+            return
         self.calibration_saved.emit(abs_path)
+        self._log(f"Calibration saved → {abs_path}")
+        self._log(self._last_preview.summary())
         QMessageBox.information(
             self, "Calibration saved",
             f"Saved personal calibration to:\n{abs_path}\n\n"
-            "The live recognizer has been reloaded; new frames use these personal ranges immediately.",
+            "The live recognizer has been reloaded; new frames use these "
+            "personal ranges immediately.",
         )
         self._refresh_existing_calibration_status()
         self.save_btn.setEnabled(False)
@@ -606,15 +817,78 @@ class CalibrationPanel(QWidget):
     def _reset(self):
         self._calibrator = None
         self._last_preview = None
+        self._step_ready_notified.clear()
         for bar in (self.s1_progress, self.s2_progress):
             bar.setValue(0)
+        self._apply_initial_button_state()
+        self.preview.clear()
+        self.log.clear()
+        self.s1_count_lbl.setText("frames captured: 0 / 0")
+        self.s2_count_lbl.setText("frames captured: 0 / 0")
+        self._refresh_existing_calibration_status()
+        self._log("Wizard reset.  Press Start Step 1 when live data is flowing.")
+
+    # ═══════════════════ HELPERS ══════════════════════════════════════
+    def _apply_initial_button_state(self):
         self.s1_start_btn.setEnabled(True)
         self.s1_finish_btn.setEnabled(False)
         self.s2_start_btn.setEnabled(False)
         self.s2_finish_btn.setEnabled(False)
         self.save_btn.setEnabled(False)
-        self.preview.clear()
-        self._refresh_existing_calibration_status()
+
+    def _refresh_progress_labels(self):
+        if self._calibrator is None:
+            return
+        s1_n = self._calibrator.step1_sample_count
+        s1_t = self._calibrator.step1_target_samples
+        s2_n = self._calibrator.step2_sample_count
+        s2_t = self._calibrator.step2_target_samples
+        self.s1_count_lbl.setText(
+            f"frames captured: {s1_n} / {s1_t}  "
+            f"(minimum {self._calibrator.step1_min_samples} to finish)"
+        )
+        self.s2_count_lbl.setText(
+            f"frames captured: {s2_n} / {s2_t}  "
+            f"(minimum {self._calibrator.step2_min_samples} to finish)"
+        )
+        phase = self._calibrator.phase
+        if phase == "STEP1_STANDING":
+            pct = int(round(100.0 * min(1.0, s1_n / max(1, s1_t))))
+            self.s1_progress.setValue(pct)
+            # Allow manual finish as soon as the minimum sample count is hit.
+            if s1_n >= self._calibrator.step1_min_samples:
+                self.s1_finish_btn.setEnabled(True)
+        elif phase == "STEP2_KNEE_BEND":
+            pct = int(round(100.0 * min(1.0, s2_n / max(1, s2_t))))
+            self.s2_progress.setValue(pct)
+            if s2_n >= self._calibrator.step2_min_samples:
+                self.s2_finish_btn.setEnabled(True)
+
+    def _warn_no_live(self):
+        QMessageBox.warning(
+            self, "No live data",
+            "No live bilateral data yet.  "
+            "Please start both MCU streams first:\n\n"
+            "  1. Click Start on the top-right of the main window.\n"
+            "  2. Wait until the two status dots turn green AND the live "
+            "sensor readout is updating.\n"
+            "  3. Then come back here and press Start Step 1.",
+        )
+        self._log("Blocked: no live bilateral data yet.")
+
+    def _error(self, title: str, msg: str):
+        QMessageBox.warning(self, title, msg)
+        self._log(f"{title}: {msg}")
+
+    def _log(self, msg: str):
+        # Prepend newest entries so users don't have to scroll; keep short.
+        stamped = time.strftime("%H:%M:%S") + "  " + msg
+        existing = self.log.toPlainText()
+        combined = stamped + ("\n" + existing if existing else "")
+        # cap log length
+        if len(combined) > 8000:
+            combined = combined[:8000]
+        self.log.setPlainText(combined)
 
     def _refresh_existing_calibration_status(self):
         if not os.path.isfile(self.JSON_PATH):
@@ -626,8 +900,8 @@ class CalibrationPanel(QWidget):
             existing = personal_calib.PersonalCalibration.load_json(self.JSON_PATH)
             self.status_lbl.setText(
                 f"Loaded existing calibration (source={existing.source}, "
-                f"subject={existing.subject}).  Re-running this wizard will overwrite "
-                "the JSON on save."
+                f"subject={existing.subject}).  Re-running this wizard will "
+                "overwrite the JSON on save."
             )
             if not self.preview.toPlainText():
                 self.preview.setPlainText(existing.summary())
@@ -673,9 +947,18 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Foot Pressure — Slim Live Monitor")
-        self.setMinimumSize(900, 640)
-        self.resize(1080, 760)
+        # The Calibration tab is the tallest content in the app; use a larger
+        # minimum so none of its buttons ever get clipped on Windows at
+        # 100–150% display scaling.  The panel is also wrapped in a scroll
+        # area so going below this is still usable (just with a scrollbar).
+        self.setMinimumSize(1200, 820)
+        self.resize(1320, 900)
         self.setStyleSheet(DARK_STYLE)
+
+        # Flipped to True by _on_socket_data on first synced bilateral frame,
+        # and pushed into the CalibrationPanel so its Start buttons are only
+        # effective when real data is flowing.
+        self._live_bilateral_ok: bool = False
 
         # TCP + CSV state
         self._thread_l: Optional[SocketThread] = None
@@ -720,8 +1003,11 @@ class MainWindow(QMainWindow):
         vbox.addWidget(sep)
 
         vbox.addWidget(self._build_live_panel())
-        vbox.addWidget(self._build_cascade_panel(), stretch=1)
-        vbox.addWidget(self._build_tabs(), stretch=0)
+        # Cascade HUD: natural size, doesn't need to grow.
+        vbox.addWidget(self._build_cascade_panel(), stretch=0)
+        # Tabs (Data capture / Inference / Calibration) get the remaining
+        # vertical space so Calibration always has room for every control.
+        vbox.addWidget(self._build_tabs(), stretch=1)
 
         self.statusBar().showMessage("Ready — set IP / ports, then Start.")
 
@@ -870,6 +1156,11 @@ class MainWindow(QMainWindow):
 
     def _build_tabs(self) -> QTabWidget:
         tabs = QTabWidget()
+        # Guarantee a sensible minimum height for whichever tab is selected,
+        # so the Calibration panel's content always has room to render the
+        # Step 1/2 buttons and progress bars without being clipped.
+        tabs.setMinimumHeight(360)
+        tabs.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
         # Data-capture tab with label strip
         cap_tab = QWidget()
@@ -973,6 +1264,11 @@ class MainWindow(QMainWindow):
         self._data_n = 0
         self.left_buffer.clear()
         self.right_buffer.clear()
+        # Calibration panel should only allow progress advance once real
+        # bilateral packets arrive — reset the flag on every Start.
+        self._live_bilateral_ok = False
+        if getattr(self, "calib_panel", None) is not None:
+            self.calib_panel.set_live_state(False)
 
         self._thread_l = SocketThread(host, port_l, "L", parent=self)
         self._thread_r = SocketThread(host, port_r, "R", parent=self)
@@ -1025,6 +1321,9 @@ class MainWindow(QMainWindow):
         self.dot_r.set_state("disconnected")
         self._conn_l = self._conn_r = "disconnected"
         self._sync_conn_label()
+        self._live_bilateral_ok = False
+        if getattr(self, "calib_panel", None) is not None:
+            self.calib_panel.set_live_state(False)
         self.statusBar().showMessage("Stopped listening (both MCUs).")
 
     # ── socket slots ────────────────────────────────────────────
@@ -1084,6 +1383,13 @@ class MainWindow(QMainWindow):
             if synced and l4 is not None and r4 is not None:
                 self._last_left = l4
                 self._last_right = r4
+                # Flip the live flag once — tell the Calibration panel it is
+                # now safe to accept Start Step 1 / Step 2 and that its
+                # progress bar will advance against real data.
+                if not self._live_bilateral_ok:
+                    self._live_bilateral_ok = True
+                    if self.calib_panel is not None:
+                        self.calib_panel.set_live_state(True)
                 self._append_csv_synced(ts_avg_mcu, l4, r4)
                 self._update_live_readouts(l4, r4)
                 if self.calib_panel is not None:

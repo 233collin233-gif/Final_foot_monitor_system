@@ -607,6 +607,37 @@ class OnlineCalibrator:
     def step2_ready(self) -> bool:
         return len(self._step2.raw) >= self._step2.target_samples
 
+    # ── thin UI-only accessors (do not change state machine behaviour) ──
+    @property
+    def step1_sample_count(self) -> int:
+        """Number of raw frames collected for step 1 so far (UI read-only)."""
+        return len(self._step1.raw)
+
+    @property
+    def step2_sample_count(self) -> int:
+        """Number of raw frames collected for step 2 so far (UI read-only)."""
+        return len(self._step2.raw)
+
+    @property
+    def step1_target_samples(self) -> int:
+        """Target number of frames for step 1 before ``step1_ready`` turns True."""
+        return self._step1.target_samples
+
+    @property
+    def step2_target_samples(self) -> int:
+        """Target number of frames for step 2 before ``step2_ready`` turns True."""
+        return self._step2.target_samples
+
+    @property
+    def step1_min_samples(self) -> int:
+        """Minimum frames required by ``finish_step1()`` — below this it raises."""
+        return self._step1.min_samples
+
+    @property
+    def step2_min_samples(self) -> int:
+        """Minimum frames required by ``finish_step2()`` — below this it raises."""
+        return self._step2.min_samples
+
     # ── final calibration  ─────────────────────────────────────────────
     def finalize(
         self,

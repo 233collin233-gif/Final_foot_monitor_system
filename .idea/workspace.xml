@@ -4,11 +4,34 @@
     <option name="autoReloadType" value="SELECTIVE" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="21bb2bea-970a-4828-ad43-f0e7933cf75a" name="更改" comment="" />
+    <list default="true" id="21bb2bea-970a-4828-ad43-f0e7933cf75a" name="更改" comment="">
+      <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/confusion_matrices/confusion_active_motion_test.png" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/confusion_matrices/confusion_active_motion_val.png" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/confusion_matrices/confusion_active_static_test.png" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/confusion_matrices/confusion_active_static_val.png" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/confusion_matrices/confusion_inactive_motion_test.png" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/confusion_matrices/confusion_inactive_motion_val.png" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/confusion_matrices/confusion_inactive_static_test.png" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/confusion_matrices/confusion_inactive_static_val.png" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/foot_pressure_monitor.py" beforeDir="false" afterPath="$PROJECT_DIR$/foot_pressure_monitor.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/ml_train_branch_rfs.py" beforeDir="false" afterPath="$PROJECT_DIR$/ml_train_branch_rfs.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/personal_calibration.json" beforeDir="false" afterPath="$PROJECT_DIR$/personal_calibration.json" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/personal_calibration.py" beforeDir="false" afterPath="$PROJECT_DIR$/personal_calibration.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/quickstart_guide.ipynb" beforeDir="false" afterPath="$PROJECT_DIR$/quickstart_guide.ipynb" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/rf_active_motion.joblib" beforeDir="false" afterPath="$PROJECT_DIR$/rf_active_motion.joblib" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/rf_active_static.joblib" beforeDir="false" afterPath="$PROJECT_DIR$/rf_active_static.joblib" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/rf_inactive_motion.joblib" beforeDir="false" afterPath="$PROJECT_DIR$/rf_inactive_motion.joblib" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/rf_inactive_static.joblib" beforeDir="false" afterPath="$PROJECT_DIR$/rf_inactive_static.joblib" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/smart_sock_pipeline.ipynb" beforeDir="false" afterPath="$PROJECT_DIR$/smart_sock_pipeline.ipynb" afterDir="false" />
+    </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
     <option name="HIGHLIGHT_NON_ACTIVE_CHANGELIST" value="false" />
     <option name="LAST_RESOLUTION" value="IGNORE" />
+  </component>
+  <component name="Git.Settings">
+    <option name="RECENT_GIT_ROOT_PATH" value="$PROJECT_DIR$" />
   </component>
   <component name="ProjectColorInfo">{
   &quot;associatedIndex&quot;: 2
@@ -26,6 +49,7 @@
     &quot;Python.ml_train_branch_rfs.executor&quot;: &quot;Run&quot;,
     &quot;Python.realtime_recognizer.executor&quot;: &quot;Run&quot;,
     &quot;RunOnceActivity.ShowReadmeOnStart&quot;: &quot;true&quot;,
+    &quot;git-widget-placeholder&quot;: &quot;main&quot;,
     &quot;last_opened_file_path&quot;: &quot;C:/ai_project&quot;
   }
 }</component>
@@ -52,12 +76,12 @@
       <breakpoints>
         <line-breakpoint enabled="true" suspend="THREAD" type="python-line">
           <url>file://$PROJECT_DIR$/foot_pressure_monitor.py</url>
-          <line>1038</line>
+          <line>1337</line>
           <option name="timeStamp" value="1" />
         </line-breakpoint>
         <line-breakpoint enabled="true" suspend="THREAD" type="python-line">
           <url>file://$PROJECT_DIR$/foot_pressure_monitor.py</url>
-          <line>858</line>
+          <line>1144</line>
           <option name="timeStamp" value="2" />
         </line-breakpoint>
       </breakpoints>
