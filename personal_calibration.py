@@ -1,44 +1,4 @@
-"""
-Per-subject range calibration for the 8 raw ADC channels
-(L_Toe, L_Forefoot, L_Heel, L_Knee, R_Toe, R_Forefoot, R_Heel, R_Knee).
-
-Why a dedicated module:
-    The 6 pressure pads have wildly different sensitivity per foot / per person
-    (heel is usually heaviest, toe is lightest; foot weight, insole fit, socks…),
-    and the 2 knee stretch sensors have person-specific slack.
-    Feeding a *global* linear map (e.g. raw/4095) into the RF bakes this
-    subject bias into the tree splits.  A one-shot personal calibration gives
-    every subject the same dynamic range [0, 4095] in their *own* usable band.
-
-Two cooperating code paths share the exact same output schema:
-
-    A.  **Offline auto-calibration** from existing labelled CSVs
-        (``OfflineAutoCalibrator``).  Uses the raw data we already have:
-          - pressure pads  →  peaks during WALKING_* / STAIRS_* / STANDING_*
-                              (min-raw = peak load = personal full load)
-                              and upper percentile of idle / sitting frames
-                              (max-raw = unloaded reference).
-          - knee stretch   →  deepest raw low during SITTING_* frames
-                              (min-raw = fully bent)
-                              and 4095 ceiling   (max-raw = straight).
-
-    B.  **Online UI calibration** (``OnlineCalibrator``) driven by the upper-
-        computer GUI.  Two guided phases asked of the wearer:
-          Step 1  —  stand still (a few seconds) → captures *pressure
-                     working range* (load distribution under body weight).
-          Step 2  —  fully bend the knee ≈ 90° → captures *stretch minimum*
-                     (maximum elongation for this subject).
-
-Both paths produce a :class:`PersonalCalibration` with identical fields,
-so downstream code (feature engineering, training, inference, UI) never
-needs to know which source was used.  Drop-in switch = change the JSON file
-path or call one function instead of the other.
-
-The 4 random forests NEVER look at anything else than the output of this
-module + the EWMA ``adaptive_preprocessing``.  The Layer-1 knee gate
-(``KNEE_RAW_STRAIGHT_TH = 3500`` in ``realtime_recognizer.py``) still reads
-*raw* ADC so the strict 4095 rule is unchanged by calibration.
-"""
+"""Per-user 6ch ADC min/max and optional frozen press-magnitude stats. Used for normalize_to_adc and adaptive preprocessor seeds."""
 from __future__ import annotations
 
 import json
@@ -49,37 +9,23 @@ from typing import Literal, Optional, Sequence
 
 import numpy as np
 
-# Keep this list *identical* to adaptive_preprocessing.CHANNEL_NAMES_DUAL —
-# several modules depend on this exact order (raw → 8-vector indexing).
 CHANNEL_NAMES_DUAL = (
-    "L_Toe", "L_Forefoot", "L_Heel", "L_Knee",
-    "R_Toe", "R_Forefoot", "R_Heel", "R_Knee",
+    "L_Forefoot", "L_Heel", "L_Knee",
+    "R_Forefoot", "R_Heel", "R_Knee",
 )
-PRESSURE_IDX = (0, 1, 2, 4, 5, 6)       # toe/ff/heel, both feet
-KNEE_IDX = (3, 7)                       # L_Knee, R_Knee
+N_CH = 6
+PRESSURE_IDX = (0, 1, 3, 4)
+KNEE_IDX = (2, 5)
 SENSOR_MAX = 4095.0
 
-# ── Tunables for the offline auto-calibrator ────────────────────────────────
-
-# TODO_PARAM: upper percentile on raw used as "unloaded / idle reference"
-#             for pressure pads.  Raw is higher when the pad is *released*.
 OFFLINE_PRESSURE_MAX_PCT = 97.0
-# TODO_PARAM: lower percentile on raw used as "fully loaded personal peak".
-#             Raw is lower when the pad is *pressed hard*.
 OFFLINE_PRESSURE_MIN_PCT = 1.0
-# TODO_PARAM: minimum span required on a pressure channel.  If the CSV shows
-#             almost no dynamic range (e.g. sensor dead), we fall back to
-#             the safe default [0, 4095] for that channel.
 OFFLINE_PRESSURE_MIN_SPAN = 120.0
 
-# TODO_PARAM: knee-stretch "deep bend" floor — percentile on SITTING frames.
 OFFLINE_KNEE_MIN_PCT = 1.0
-# TODO_PARAM: safety clamp so the knee personal range always reaches the rail.
 OFFLINE_KNEE_MAX = 4095.0
-# TODO_PARAM: minimum span required on the knee channel (avoid degenerate calib).
 OFFLINE_KNEE_MIN_SPAN = 300.0
 
-# Labels considered "loaded" for each sensor family during offline fitting.
 _LOADED_LABELS_PRESSURE = frozenset({
     "WALKING_FORWARD", "WALKING_BACKWARD",
     "STAIRS_UP", "STAIRS_DOWN",
@@ -94,46 +40,13 @@ _IDLE_LABELS_PRESSURE = frozenset({
 })
 
 
-# ── Core dataclass ──────────────────────────────────────────────────────────
-
 CalibrationSource = Literal["offline_auto_csv", "ui_online_two_step", "manual"]
 
 
 @dataclass
 class PersonalCalibration:
-    """Per-channel personal working range **plus** global statistics.
-
-    Legacy fields (always present):
-
-    min_raw : np.ndarray, shape (8,)
-        Lower ADC bound per channel, **inclusive**.
-          * pressure pads → raw at full personal load (heavy step / stand).
-          * knee stretch → raw at maximum bend.
-    max_raw : np.ndarray, shape (8,)
-        Upper ADC bound per channel, **inclusive**.
-          * pressure pads → raw when pad is unloaded (foot lifted).
-          * knee stretch → raw when leg is straight (usually 4095 rail).
-
-    **Global statistics** (may be ``None`` → fall back to online EWMA).  When
-    present, they freeze the :class:`adaptive_preprocessing.AdaptiveSensorPreprocessor`'s
-    learned state so *every* CSV / every live frame is preprocessed against
-    the exact same numbers.  All are shape ``(8,)``.
-
-    baseline_raw : np.ndarray
-        Per-channel *reference* raw (pad unloaded / knee straight).  Used as
-        the fixed baseline in ``press_mag = baseline_raw - raw`` and
-        ``baseline_removed = raw - baseline_raw``.
-    press_min, press_max : np.ndarray
-        Global min / max of ``press_mag``, used as the denominator in the
-        ``relative_pressure_ratio`` instead of a per-trajectory rolling span.
-    press_mean, press_std : np.ndarray
-        Global mean / std of ``press_mag``, used in
-        ``adaptive_zscore = (press_mag - press_mean) / press_std`` instead of
-        the online EWMA estimate.
-
-    ``has_global_stats`` returns True iff all five global fields are set —
-    the adaptive bank treats that as "freeze everything, use these numbers".
-    """
+    """Per-channel min_raw/max_raw for linear scaling to [0,4095].
+    Optional press-mag globals freeze adaptive_preprocessing when has_global_stats is true."""
 
     min_raw: np.ndarray
     max_raw: np.ndarray
@@ -147,21 +60,20 @@ class PersonalCalibration:
     press_mean: Optional[np.ndarray] = None
     press_std: Optional[np.ndarray] = None
 
-    # ── construction helpers ────────────────────────────────────────────
     def __post_init__(self) -> None:
-        self.min_raw = np.asarray(self.min_raw, dtype=np.float64).reshape(8)
-        self.max_raw = np.asarray(self.max_raw, dtype=np.float64).reshape(8)
+        self.min_raw = np.asarray(self.min_raw, dtype=np.float64).reshape(N_CH)
+        self.max_raw = np.asarray(self.max_raw, dtype=np.float64).reshape(N_CH)
         self._sanity_clamp()
         for name in ("baseline_raw", "press_min", "press_max",
                      "press_mean", "press_std"):
             val = getattr(self, name)
             if val is not None:
-                arr = np.asarray(val, dtype=np.float64).reshape(8)
+                arr = np.asarray(val, dtype=np.float64).reshape(N_CH)
                 setattr(self, name, arr)
 
     def _sanity_clamp(self) -> None:
-        """Guarantee ``max > min + 1`` on every channel."""
-        for i in range(8):
+        """Enforce min/max in [0,4095] and span >= 1."""
+        for i in range(N_CH):
             lo = float(self.min_raw[i])
             hi = float(self.max_raw[i])
             lo = max(0.0, min(lo, SENSOR_MAX - 1.0))
@@ -169,10 +81,9 @@ class PersonalCalibration:
             self.min_raw[i] = lo
             self.max_raw[i] = hi
 
-    # ── global-stats helpers ───────────────────────────────────────────
     @property
     def has_global_stats(self) -> bool:
-        """True iff every channel has a globally-computed baseline / range / moments."""
+        """All five press-mag globals present for frozen preprocessing."""
         return all(
             getattr(self, k) is not None
             for k in ("baseline_raw", "press_min", "press_max",
@@ -180,17 +91,12 @@ class PersonalCalibration:
         )
 
     def to_channel_seeds(self) -> Optional[list]:
-        """Return one ``adaptive_preprocessing.ChannelSeed`` per channel, or ``None``.
-
-        Returns ``None`` when :attr:`has_global_stats` is ``False`` so the
-        caller can transparently fall back to the EWMA-only bank.
-        """
+        """List of ChannelSeed, or None if has_global_stats is false."""
         if not self.has_global_stats:
             return None
-        # Lazy import to avoid a circular dep at module load time.
         from adaptive_preprocessing import ChannelSeed  # noqa: WPS433
         seeds = []
-        for i in range(8):
+        for i in range(N_CH):
             seeds.append(ChannelSeed(
                 baseline_raw=float(self.baseline_raw[i]),     # type: ignore[index]
                 press_min=float(self.press_min[i]),           # type: ignore[index]
@@ -202,21 +108,17 @@ class PersonalCalibration:
 
     @classmethod
     def identity(cls) -> "PersonalCalibration":
-        """``[0, 4095]`` for all 8 channels — equivalent to *no* calibration."""
+        """Full-span identity mapping (no per-user warping)."""
         return cls(
-            min_raw=np.zeros(8, dtype=np.float64),
-            max_raw=np.full(8, SENSOR_MAX, dtype=np.float64),
+            min_raw=np.zeros(N_CH, dtype=np.float64),
+            max_raw=np.full(N_CH, SENSOR_MAX, dtype=np.float64),
             source="manual",
             subject="identity",
             notes="identity mapping — downstream features see raw ADC unchanged",
         )
 
-    # ── forward normalization  ──────────────────────────────────────────
     def normalize_to_unit(self, raw_8: np.ndarray) -> np.ndarray:
-        """Map each channel of ``raw_8`` into ``[0, 1]`` using its personal range.
-
-        Accepts ``(8,)`` or ``(T, 8)``; returns same shape, clipped.
-        """
+        """Linear map each channel to [0,1] from min_raw..max_raw."""
         r = np.asarray(raw_8, dtype=np.float64)
         lo = self.min_raw
         hi = self.max_raw
@@ -224,16 +126,9 @@ class PersonalCalibration:
         return np.clip(out, 0.0, 1.0)
 
     def normalize_to_adc(self, raw_8: np.ndarray) -> np.ndarray:
-        """Same as :meth:`normalize_to_unit` but re-scaled to ``[0, 4095]``.
-
-        We keep the ADC-like scale because the downstream EWMA preprocessor
-        in ``adaptive_preprocessing`` has thresholds (``IDLE_PRESS_GATE_RAW``,
-        ``LOW_DYNAMIC_RANGE_TH``) that were tuned against raw ADC amplitudes.
-        Staying in that scale means we do *not* have to retune those.
-        """
+        """Like normalize_to_unit but scaled to 0..4095 for downstream raw-level thresholds."""
         return self.normalize_to_unit(raw_8) * SENSOR_MAX
 
-    # ── JSON round-trip (one JSON per subject) ──────────────────────────
     def to_dict(self) -> dict:
         out = {
             "channels": list(CHANNEL_NAMES_DUAL),
@@ -244,13 +139,11 @@ class PersonalCalibration:
             "created_at": float(self.created_at),
             "notes": self.notes,
         }
-        # Only serialise global stats if we actually have them; older JSONs
-        # without these keys continue to load fine (has_global_stats==False).
         for name in ("baseline_raw", "press_min", "press_max",
                      "press_mean", "press_std"):
             val = getattr(self, name)
             if val is not None:
-                out[name] = [float(x) for x in np.asarray(val).reshape(8)]
+                out[name] = [float(x) for x in np.asarray(val).reshape(N_CH)]
         return out
 
     def save_json(self, path: str) -> str:
@@ -258,36 +151,67 @@ class PersonalCalibration:
             json.dump(self.to_dict(), f, indent=2, ensure_ascii=False)
         return os.path.abspath(path)
 
+    @staticmethod
+    def _strip_legacy_toe_arrays(arr8: np.ndarray) -> np.ndarray:
+        a = np.asarray(arr8, dtype=np.float64).ravel()
+        if a.size != 8:
+            return a
+        return np.array(
+            [a[1], a[2], a[3], a[5], a[6], a[7]], dtype=np.float64,
+        )
+
     @classmethod
     def load_json(cls, path: str) -> "PersonalCalibration":
         with open(path, "r", encoding="utf-8") as f:
             d = json.load(f)
         ch = list(d.get("channels", CHANNEL_NAMES_DUAL))
-        if tuple(ch) != CHANNEL_NAMES_DUAL:
-            raise ValueError(
-                f"Channel layout in {path} does not match expected "
-                f"{CHANNEL_NAMES_DUAL}; got {ch}"
-            )
+        legacy8 = len(ch) == 8 and "L_Toe" in ch
 
         def _maybe_array(key: str) -> Optional[np.ndarray]:
             return (np.asarray(d[key], dtype=np.float64)
                     if key in d and d[key] is not None else None)
 
+        def _maybe_strip(key: str) -> Optional[np.ndarray]:
+            v = _maybe_array(key)
+            return None if v is None else cls._strip_legacy_toe_arrays(v)
+
+        if legacy8:
+            min_r = cls._strip_legacy_toe_arrays(d["min_raw"])
+            max_r = cls._strip_legacy_toe_arrays(d["max_raw"])
+            br = _maybe_strip("baseline_raw")
+            pmn = _maybe_strip("press_min")
+            pmx = _maybe_strip("press_max")
+            pme = _maybe_strip("press_mean")
+            pst = _maybe_strip("press_std")
+            notes = (d.get("notes") or "") + " [migrated 8ch→6ch, toe dropped]"
+        else:
+            if tuple(ch) != CHANNEL_NAMES_DUAL:
+                raise ValueError(
+                    f"Channel layout in {path} does not match {CHANNEL_NAMES_DUAL}; got {ch}",
+                )
+            min_r = np.asarray(d["min_raw"], dtype=np.float64)
+            max_r = np.asarray(d["max_raw"], dtype=np.float64)
+            br = _maybe_array("baseline_raw")
+            pmn = _maybe_array("press_min")
+            pmx = _maybe_array("press_max")
+            pme = _maybe_array("press_mean")
+            pst = _maybe_array("press_std")
+            notes = d.get("notes", "")
+
         return cls(
-            min_raw=np.asarray(d["min_raw"], dtype=np.float64),
-            max_raw=np.asarray(d["max_raw"], dtype=np.float64),
+            min_raw=min_r,
+            max_raw=max_r,
             source=d.get("source", "manual"),
             subject=d.get("subject", "default"),
             created_at=float(d.get("created_at", time.time())),
-            notes=d.get("notes", ""),
-            baseline_raw=_maybe_array("baseline_raw"),
-            press_min=_maybe_array("press_min"),
-            press_max=_maybe_array("press_max"),
-            press_mean=_maybe_array("press_mean"),
-            press_std=_maybe_array("press_std"),
+            notes=notes,
+            baseline_raw=br,
+            press_min=pmn,
+            press_max=pmx,
+            press_mean=pme,
+            press_std=pst,
         )
 
-    # ── readable summary for notebook / UI ─────────────────────────────
     def summary(self) -> str:
         lines = [
             f"PersonalCalibration(subject={self.subject!r}, source={self.source!r})",
@@ -317,29 +241,11 @@ class PersonalCalibration:
         return "\n".join(lines)
 
 
-# ── Path A: offline auto-calibration from labelled CSV ──────────────────────
 
 
 @dataclass
 class OfflineAutoCalibrator:
-    """Scan a labelled ``(T, 8) raw_adc`` + ``labels[T]`` sequence and
-    derive a :class:`PersonalCalibration` without any user interaction.
-
-    Pressure pads (toe / ff / heel on both feet):
-        * ``min_raw`` ← ``OFFLINE_PRESSURE_MIN_PCT``-percentile of raw
-          restricted to *loaded* labels (walking, stairs, standing).
-          These are the user's personal heavy-step peaks.
-        * ``max_raw`` ← ``OFFLINE_PRESSURE_MAX_PCT``-percentile of raw
-          restricted to *idle* labels (sitting) — pad unloaded.
-
-    Knee stretch pads (L_Knee, R_Knee):
-        * ``min_raw`` ← ``OFFLINE_KNEE_MIN_PCT``-percentile of raw
-          restricted to SITTING_* / STAIRS_* — the deepest personal bend.
-        * ``max_raw`` ← ``OFFLINE_KNEE_MAX`` (rail 4095 — straight leg).
-
-    If a label family is absent in the CSV, we fall back to a safe default
-    (``[0, 4095]``) for that channel and log a warning in ``.warnings``.
-    """
+    """Fit min_raw/max_raw from label-conditioned percentiles on stacked T×6 ADC, plus global press-mag stats."""
 
     pressure_min_pct: float = OFFLINE_PRESSURE_MIN_PCT
     pressure_max_pct: float = OFFLINE_PRESSURE_MAX_PCT
@@ -357,14 +263,16 @@ class OfflineAutoCalibrator:
         notes: str = "",
     ) -> PersonalCalibration:
         data_t8 = np.asarray(data_t8, dtype=np.float64)
-        if data_t8.ndim != 2 or data_t8.shape[1] != 8:
-            raise ValueError(f"data_t8 must be (T, 8); got {data_t8.shape}")
+        if data_t8.ndim == 2 and data_t8.shape[1] == 8:
+            data_t8 = np.column_stack([data_t8[:, 1:4], data_t8[:, 5:8]])
+        if data_t8.ndim != 2 or data_t8.shape[1] != N_CH:
+            raise ValueError(f"data must be (T, {N_CH}) or legacy (T, 8); got {data_t8.shape}")
         if len(labels) != data_t8.shape[0]:
             raise ValueError("len(labels) must equal T")
 
         labels = np.asarray([str(x).strip().upper() for x in labels])
-        min_raw = np.zeros(8, dtype=np.float64)
-        max_raw = np.full(8, SENSOR_MAX, dtype=np.float64)
+        min_raw = np.zeros(N_CH, dtype=np.float64)
+        max_raw = np.full(N_CH, SENSOR_MAX, dtype=np.float64)
 
         mask_load_p = np.isin(labels, sorted(_LOADED_LABELS_PRESSURE))
         mask_idle_p = np.isin(labels, sorted(_IDLE_LABELS_PRESSURE))
@@ -418,20 +326,11 @@ class OfflineAutoCalibrator:
             min_raw[ch] = lo
             max_raw[ch] = hi
 
-        # ── Global statistics across the FULL concatenated dataset ────────
-        # baseline_raw := max_raw (unloaded pad / straight knee reference).
-        # press_mag   := baseline_raw - raw  (≥ 0 when loaded / bent).
-        # We use the WHOLE (T, 8) matrix here — no label mask, no per-file
-        # split — so one subject's calibrator sees *exactly the same* stats
-        # every CSV is going to be preprocessed against.
         baseline_raw = max_raw.copy()
-        press_mag = baseline_raw[None, :] - data_t8        # (T, 8)
-        # Clip at zero for stability; pads that read *higher* than baseline
-        # during take-off would otherwise inject negative tails into the mean.
+        press_mag = baseline_raw[None, :] - data_t8
         press_mag_nonneg = np.clip(press_mag, 0.0, None)
         press_min = np.percentile(press_mag_nonneg, 1.0, axis=0)
         press_max = np.percentile(press_mag_nonneg, 99.0, axis=0)
-        # Ensure non-degenerate range so the downstream divisor stays safe.
         degenerate = (press_max - press_min) < 1.0
         if np.any(degenerate):
             for ch in np.where(degenerate)[0]:
@@ -443,7 +342,7 @@ class OfflineAutoCalibrator:
                 press_max[ch] = SENSOR_MAX
         press_mean = press_mag_nonneg.mean(axis=0)
         press_std = press_mag_nonneg.std(axis=0, ddof=0)
-        press_std = np.maximum(press_std, 1.0)   # std floor → no /0 downstream
+        press_std = np.maximum(press_std, 1.0)
 
         return PersonalCalibration(
             min_raw=min_raw,
@@ -465,12 +364,7 @@ def auto_calibrate_from_csv_dir(
     subject: str = "offline_auto_population",
     save_to: Optional[str] = None,
 ) -> PersonalCalibration:
-    """Convenience wrapper: walk ``saving_data/sensor_data_dual_labeled_*.csv``
-    (via :func:`ml_activity_features.load_csv_files`), run
-    :class:`OfflineAutoCalibrator`, optionally dump JSON.
-    """
-    # Lazy import to avoid a hard cycle (``ml_activity_features`` already
-    # imports ``adaptive_preprocessing`` but not this file).
+    """Load all dual labeled CSVs from csv_dir, fit OfflineAutoCalibrator, optionally save JSON."""
     from ml_activity_features import load_csv_files  # noqa: WPS433
 
     data, labels, _subjects, mode = load_csv_files(
@@ -489,7 +383,6 @@ def auto_calibrate_from_csv_dir(
     return calib
 
 
-# ── Path B: UI-driven two-step online calibration ───────────────────────────
 
 OnlinePhase = Literal["IDLE", "STEP1_STANDING", "STEP1_DONE",
                       "STEP2_KNEE_BEND", "DONE"]
@@ -499,34 +392,12 @@ OnlinePhase = Literal["IDLE", "STEP1_STANDING", "STEP1_DONE",
 class _PhaseBuffer:
     raw: list[np.ndarray] = field(default_factory=list)
     t0: float = 0.0
-    min_samples: int = 20   # default 20 frames ≈ 2 s @ 10 Hz
-    target_samples: int = 50  # default 50 frames ≈ 5 s @ 10 Hz
+    min_samples: int = 20
+    target_samples: int = 50
 
 
 class OnlineCalibrator:
-    """Two-step wearer-guided calibration, designed for the PyQt UI.
-
-    Intended flow (UI side):
-
-        cal = OnlineCalibrator(sample_hz=10)
-        cal.start_step1()                     # ← UI shows "stand still"
-        for frame in stream:                  # push every 100 ms
-            progress = cal.feed(frame)
-            if cal.step1_ready:               # ≥ target_samples collected
-                break
-        cal.finish_step1()
-
-        cal.start_step2()                     # ← UI shows "bend knee 90°"
-        for frame in stream:
-            cal.feed(frame)
-            if cal.step2_ready:
-                break
-        calib = cal.finalize(subject="alice")  # PersonalCalibration
-        calib.save_json("personal_calibration.json")
-
-    Only *this* function writes calibration state; the recognizer just
-    calls :meth:`PersonalCalibration.normalize_to_adc` per frame.
-    """
+    """UI two-step capture (stand, then knee bend) to build a PersonalCalibration."""
 
     def __init__(
         self,
@@ -547,7 +418,6 @@ class OnlineCalibrator:
         )
         self.phase: OnlinePhase = "IDLE"
 
-    # ── step 1: natural standing (pressure range) ───────────────────────
     def start_step1(self) -> None:
         self._step1 = _PhaseBuffer(
             target_samples=self._step1.target_samples,
@@ -566,7 +436,6 @@ class OnlineCalibrator:
             )
         self.phase = "STEP1_DONE"
 
-    # ── step 2: knee bend 90° (stretch range) ──────────────────────────
     def start_step2(self) -> None:
         if self.phase != "STEP1_DONE":
             raise RuntimeError("Must finish step 1 before starting step 2")
@@ -587,10 +456,9 @@ class OnlineCalibrator:
             )
         self.phase = "DONE"
 
-    # ── sample ingestion ───────────────────────────────────────────────
-    def feed(self, raw_8: Sequence[float]) -> float:
-        """Feed one dual-foot raw frame.  Returns current-phase progress 0..1."""
-        arr = np.asarray(raw_8, dtype=np.float64).reshape(8)
+    def feed(self, raw_6: Sequence[float]) -> float:
+        """One 6ch frame; returns step progress in [0,1]."""
+        arr = np.asarray(raw_6, dtype=np.float64).reshape(N_CH)
         if self.phase == "STEP1_STANDING":
             self._step1.raw.append(arr)
             return min(1.0, len(self._step1.raw) / max(1, self._step1.target_samples))
@@ -607,79 +475,56 @@ class OnlineCalibrator:
     def step2_ready(self) -> bool:
         return len(self._step2.raw) >= self._step2.target_samples
 
-    # ── thin UI-only accessors (do not change state machine behaviour) ──
     @property
     def step1_sample_count(self) -> int:
-        """Number of raw frames collected for step 1 so far (UI read-only)."""
         return len(self._step1.raw)
 
     @property
     def step2_sample_count(self) -> int:
-        """Number of raw frames collected for step 2 so far (UI read-only)."""
         return len(self._step2.raw)
 
     @property
     def step1_target_samples(self) -> int:
-        """Target number of frames for step 1 before ``step1_ready`` turns True."""
         return self._step1.target_samples
 
     @property
     def step2_target_samples(self) -> int:
-        """Target number of frames for step 2 before ``step2_ready`` turns True."""
         return self._step2.target_samples
 
     @property
     def step1_min_samples(self) -> int:
-        """Minimum frames required by ``finish_step1()`` — below this it raises."""
         return self._step1.min_samples
 
     @property
     def step2_min_samples(self) -> int:
-        """Minimum frames required by ``finish_step2()`` — below this it raises."""
         return self._step2.min_samples
 
-    # ── final calibration  ─────────────────────────────────────────────
     def finalize(
         self,
         *,
         subject: str = "ui_online",
         notes: str = "",
     ) -> PersonalCalibration:
-        """Collapse the two sample buffers into a :class:`PersonalCalibration`.
-
-        Pressure channels (idx 0,1,2,4,5,6):
-            * ``min_raw`` = percentile-1 of *step 1* frames → peak load
-              produced by the subject's own body weight while standing.
-            * ``max_raw`` = rail 4095 → unloaded reference (pad in air).
-
-        Knee channels (idx 3, 7):
-            * ``min_raw`` = percentile-1 of *step 2* frames → deepest bend.
-            * ``max_raw`` = rail 4095 → straight leg.
-        """
+        """Merge step buffers into min_raw/max_raw and press-mag globals."""
         if self.phase != "DONE":
             raise RuntimeError(
                 f"finalize() requires phase == DONE; current={self.phase!r}"
             )
-        s1 = np.stack(self._step1.raw, axis=0)   # (N1, 8) natural standing
-        s2 = np.stack(self._step2.raw, axis=0)   # (N2, 8) knee bend ≈ 90°
+        s1 = np.stack(self._step1.raw, axis=0)
+        s2 = np.stack(self._step2.raw, axis=0)
 
-        min_raw = np.zeros(8, dtype=np.float64)
-        max_raw = np.full(8, SENSOR_MAX, dtype=np.float64)
+        min_raw = np.zeros(N_CH, dtype=np.float64)
+        max_raw = np.full(N_CH, SENSOR_MAX, dtype=np.float64)
 
-        # Pressure — use step 1 (subject is standing, all pads loaded)
         for ch in PRESSURE_IDX:
             min_raw[ch] = float(np.percentile(s1[:, ch], 1.0))
             max_raw[ch] = SENSOR_MAX
 
-        # Knee — use step 2 (subject is bending → low raw)
         for ch in KNEE_IDX:
             min_raw[ch] = float(np.percentile(s2[:, ch], 1.0))
             max_raw[ch] = SENSOR_MAX
 
-        # ── Global stats from the UI buffers, matching the offline schema ──
-        # Combine step1 + step2 so the moments cover both loaded-pads and
-        # bent-knee regimes.  baseline_raw == max_raw as offline.
-        all_frames = np.vstack([s1, s2])          # (N1+N2, 8)
+        all_frames = np.vstack([s1, s2])
         baseline_raw = max_raw.copy()
         press_mag = np.clip(baseline_raw[None, :] - all_frames, 0.0, None)
         press_min = np.percentile(press_mag, 1.0,  axis=0)
@@ -706,7 +551,6 @@ class OnlineCalibrator:
         )
 
 
-# ── Default filename for the on-disk JSON (read by recognizer / UI) ─────────
 
 DEFAULT_CALIBRATION_FILENAME = "personal_calibration.json"
 
@@ -714,10 +558,7 @@ DEFAULT_CALIBRATION_FILENAME = "personal_calibration.json"
 def load_default_calibration(
     search_dirs: Sequence[str] = (".",),
 ) -> Optional[PersonalCalibration]:
-    """Look for ``personal_calibration.json`` in the given dirs, in order.
-
-    Returns ``None`` if none is found (caller can fall back to identity).
-    """
+    """Load personal_calibration.json from the first existing path in search_dirs, else None."""
     for d in search_dirs:
         p = os.path.join(d, DEFAULT_CALIBRATION_FILENAME)
         if os.path.isfile(p):

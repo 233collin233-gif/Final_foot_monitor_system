@@ -1,48 +1,4 @@
-"""
-双足压力 + 膝盖拉伸传感器的实时步态/姿态识别器。
-===================================================================================
-整体思路是分层判断，核心是严格的 4095 判据（膝盖传感器满量程 = 腿伸直）。
-
-  1) 先做自适应预处理（DualFootAdaptiveBank），再走滑动窗口。
-
-  2) 第一层：膝盖 ACTIVE / INACTIVE 门控（严格 4095 规则）。
-
-     判断逻辑：
-       * 只要有任意一侧膝盖的原始 ADC 没顶到 4095（也就是
-         min(raw_knee_l, raw_knee_r) < KNEE_RAW_STRAIGHT_TH），
-         那这一帧就算 ACTIVE 候选。
-       * 只有两侧膝盖都贴着 4095 跑，才算 INACTIVE 候选。
-
-     为了避免站着不动时因为噪声来回抖，我加了防抖：
-       用滑窗累计 sustain / release 两个计数器（KNEE_GATE_SUSTAIN_SAMPLES /
-       KNEE_GATE_RELEASE_SAMPLES），再配一个最短保持时间
-       （KNEE_GATE_MIN_HOLD_S），保证分支状态不会一下被小抖动翻过去。
-
-  3) 第二层：MOTION / STATIC 细分。
-
-     * ACTIVE 分支里：
-        - MOTION  → 上楼 / 下楼（有周期性的 4095 尖峰 + 真实迈步事件）
-        - STATIC  → 正常坐 / 翘二郎腿（整段都到不了 4095）
-
-     * INACTIVE 分支要求更严（这是我自己定的规矩，防止站着抖被误判成走路）：
-        - 必须在最近窗口里看到至少 WALK_ENTER_MIN_STEPS 次"真正抬脚"的事件
-          （用双足接触检测，不只看压力大小），同时还要有同样数量的膝盖摆动
-          到 ≥ 4095 轨的记录，才允许从 STATIC 切到 MOTION（前走 / 后走）。
-        - 站着时身体微小的重心晃动会被压住，不会误触发。
-
-  4) 分支 RF：根据前两层的结果，只调四个独立模型中的一个：
-        rf_active_motion.joblib   → STAIRS_UP / STAIRS_DOWN
-        rf_active_static.joblib   → SITTING_NORMAL / SITTING_CROSSLEGGED
-        rf_inactive_motion.joblib → WALKING_FORWARD / WALKING_BACKWARD
-        rf_inactive_static.joblib → STANDING_UPRIGHT / LEFT_LEAN / RIGHT_LEAN
-
-步态签名的那些标量作为辅助特征喂进去，布局和训练时保持一致，
-具体看 ml_branch_models.build_auxiliary_vector 里的写法。
-
-SIT_TO_STAND 是纯规则判的，不走 RF。
-
-依赖：numpy、collections.deque、time（不用 scipy，不想引太多依赖）
-"""
+"""Live 6ch stream: adaptive bank → knee/motion routing → branch RF → debounced pose state."""
 
 from __future__ import annotations
 
@@ -52,203 +8,108 @@ from collections import deque
 
 import numpy as np
 
+from adaptive_preprocessing import CHANNEL_NAMES_DUAL, DualFootAdaptiveBank
 from ml_activity_features import WINDOW_SIZE as ML_WINDOW_SIZE
 from ml_branch_models import (
-    BranchRFEnsemble,
-    build_auxiliary_vector,
-    build_full_feature_vector,
     BRANCH_TO_FILE,
+    BranchRFEnsemble,
+    branch_base_proba_threshold,
+    build_full_feature_vector_and_g8_from_window,
+    build_full_feature_vector_from_window,
 )
-from adaptive_preprocessing import CHANNEL_NAMES_DUAL, DualFootAdaptiveBank
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  这一堆是可调参数，后面调阈值主要就是改这里
-# ═══════════════════════════════════════════════════════════════════════════
+from gait_knee_features import (
+    KNEE_MODES,
+    eight_named_gait_features,
+    knee_mode_argmax,
+    knee_soft_scores_3,
+)
 
 SENSOR_MAX = 4095.0
-
-# 要和单片机固件的出帧频率保持一致。目前硬件是每 100ms 发一帧双足数据
-# （用 CSV 时间戳差值验证过），也就是 10 Hz。
-# 如果改了这个值，ml_activity_features.SAMPLE_HZ 也要跟着改，而且四个 RF 模型都要重训。
 SAMPLE_HZ = 10
-
-# EMA 平滑系数，范围 (0, 1]，越小越平滑但越滞后
 EMA_ALPHA = 0.25
-
-# ── 脚跟迈步检测（旧方案，留着兜底） ─────────────────────────────────
-
-# 脚跟信号再过一次 EMA，只用在步检测里
 HEEL_STEP_EMA_ALPHA = 0.35
-
-# Schmitt 触发器的初始上下阈值，累计到 3 步以上会根据最近的峰谷自动重新估算
 STEP_INIT_LOW = 0.25
 STEP_INIT_HIGH = 0.45
-
-# 每只脚的迈步冷却时间（秒），0.30s 对应单脚最多 200 步/分钟，正常人肯定够用
 STEP_COOLDOWN_S = 0.30
 STEP_COOLDOWN_SAMPLES = max(4, int(round(SAMPLE_HZ * STEP_COOLDOWN_S)))
-
-# 自适应阈值用最近多少个峰 / 谷做平均
 ADAPTIVE_HISTORY = 10
-
-# 峰谷差小于这个就认为信号太弱、不够稳定，不拿来更新阈值
 ADAPTIVE_MIN_SWING = 0.04
-
-# 上下阈值取峰谷之间的这个比例位置
 ADAPTIVE_LOW_FRAC = 0.30
 ADAPTIVE_HIGH_FRAC = 0.60
-
-# 追峰追谷用的迟滞（按当前峰谷差的比例算）
 PEAK_TROUGH_HYST = 0.08
-
-# ── 脚底接触检测（主用的双足迈步方案） ────────────────────────────────
-
-# 单脚三区压力之和低于这个，就当抬脚了
 FOOT_OFF_GROUND_TH = 0.10
-
-# 单脚三区压力之和高于这个，就当落地了
 FOOT_ON_GROUND_TH = 0.20
-
-# 同一只脚两次有效迈步之间的最小间隔（秒），防抖
 STEP_MIN_GAP_S = 0.30
-
-# 连续多少帧低于抬脚阈值才判定为"抬起来了"
 FOOT_OFF_MIN_SAMPLES = 3
-
-# 连续多少帧高于落地阈值才判定为"踩下去了"
 FOOT_ON_MIN_SAMPLES = 3
-
-# ── 方向判断 ────────────────────────────────────────────────────────
-
-# 每踩一步之后，后续观察窗口长度（秒），用来对比脚跟和脚尖先到达峰值
-WINDOW_SECONDS = 0.6
-
-# 最近几步做多数投票来决定方向
-VOTE_K_STEPS = 3
-
-# ── 第二层：MOTION / STATIC 细分 ────────────────────────────────────
-
-# 整体运动幅度太小的话，就别进 MOTION 分支了（可能只是抖一抖）
 MOTION_MIN_AMPLITUDE = 0.10
-
-# 连续几帧都同时满足"有步伐 + 幅度够"，才确认进入 MOTION
+MOTION_MIN_AMPLITUDE_MAX = 0.25
+MOTION_ADAPTIVE_WINDOW_S = 6.0
+MOTION_ADAPTIVE_QUANTILE = 0.70
+MOTION_ADAPTIVE_UPPER_QUANTILE = 0.90
+MOTION_ADAPTIVE_GAIN = 0.90
+MOTION_ADAPTIVE_EMA_ALPHA = 0.25
 MOTION_CONFIRM_FRAMES = 4
-
-# 进 MOTION 之后最少待够这么久，才允许切回 STATIC，避免来回抖
 MOTION_MIN_HOLD_S = 1.0
-
-# 在 MOTION 里连续这么多帧都没证据了，才允许切回 STATIC
 LAYER2_STATIC_CONFIRM_FRAMES = 6
-
-# ── 走路进入的强保护（只在 INACTIVE 分支用） ─────────────────────────
-# 这是为了防止"站着身体微抖"被错判成走路。
-# INACTIVE 分支下从 STATIC 切到 MOTION，额外要求：
-#   (a) 最近窗口里有至少 WALK_ENTER_MIN_STEPS 次真实抬脚事件；并且
-#   (b) 最近 WALK_EVIDENCE_WINDOW_S 秒内，膝盖至少有 WALK_ENTER_MIN_STEPS 次
-#       伸到接近 4095 轨的证据（也就是摆腿确实到位了）。
-
-# 进入 WALKING 前需要的最少真实迈步数
 WALK_ENTER_MIN_STEPS = 2
-# 累计迈步 + 膝盖伸直证据的滚动窗口（秒）
 WALK_EVIDENCE_WINDOW_S = 2.0
-# 膝盖原始 ADC 达到这个值才算"这一下摆腿伸直了"
-WALK_KNEE_EXTEND_RAIL_TH = 4080.0
-
-# ── 状态机 ──────────────────────────────────────────────────────────
-
-# 一个状态进入后至少保持这么久才允许切换（秒）
+WALK_KNEE_RATIO_EXTEND_TH = 0.78
 STATE_MIN_DURATION_S = 1.0
-
-# 最后一次迈步之后过了这么久没新步，就退出 WALKING / STAIRS
 WALK_TIMEOUT_S = 2.0
-
-# ── 坐姿检测 ────────────────────────────────────────────────────────
-
-# 脚底总压力小于这个，判为坐着（脚上基本没负重）
-SIT_PSUM_TH = 0.08
-
-# 坐着时脚底压力标准差超过这个，倾向于翘腿
-SIT_CROSSLEG_STD_TH = 0.04
-
-# 坐着时膝盖偏离基线超过这个，也倾向于翘腿
-SIT_CROSSLEG_KNEE_TH = 0.15
-
-# ── 第一层膝盖门控（ACTIVE / INACTIVE 切换） ────────────────────────
-# 严格 4095 规则（顶上模块 docstring 有写）：
-#   • 瞬时 ACTIVE  ← min(raw_knee_l, raw_knee_r) <  KNEE_RAW_STRAIGHT_TH
-#     （至少一条腿是弯的，没顶到 4095）
-#   • 瞬时 INACTIVE ← min(raw_knee_l, raw_knee_r) >= KNEE_RAW_STRAIGHT_TH
-#     （两条腿都顶在 4095 附近）
-
-# 膝盖 ADC 高于这个就当"伸直"（4095 是满量程）。
-# 往 4095 靠 → ACTIVE 更灵敏，一点点弯就触发；
-# 往下压（比如 3000）→ 会忽略走路时小幅的膝盖弯，只对上下楼 / 坐反应。
-KNEE_RAW_STRAIGHT_TH = 3500.0
-
-# 连续几帧满足瞬时 ACTIVE 规则才真正切到 ACTIVE。
-# 大了更抗单帧误判，代价是切换变慢。
-KNEE_GATE_SUSTAIN_SAMPLES = max(3, int(round(SAMPLE_HZ * 0.40)))
-# 连续几帧不满足 ACTIVE 规则才掉回 INACTIVE。
-# 大了在两步楼梯之间短暂伸直时也不会掉出 ACTIVE。
-KNEE_GATE_RELEASE_SAMPLES = max(3, int(round(SAMPLE_HZ * 0.35)))
-# 每次第一层切换后，新分支至少锁这么久（秒），防止站坐临界来回闪。
-KNEE_GATE_MIN_HOLD_S = 0.6
-
-# ── 站立检测 ────────────────────────────────────────────────────────
-
-# 没迈步但 p_sum >= 这个阈值，就是站着
+MOTION_SET = frozenset({
+    "WALKING_FORWARD", "WALKING_BACKWARD", "STAIRS_UP", "STAIRS_DOWN",
+})
+STATIC_SET = frozenset({
+    "STANDING_UPRIGHT", "STANDING_LEFT_LEAN", "STANDING_RIGHT_LEAN",
+    "SITTING_NORMAL", "SITTING_CROSSLEGGED",
+})
+STAIRS_LABELS = frozenset({"STAIRS_UP", "STAIRS_DOWN"})
+MOTION_ENTER_VAR_TH = 0.12
+MOTION_ENTER_AMP_TH = 0.15
+MOTION_ENTER_CONFIRM_FRAMES = 6
+MOTION_STOP_RELEASE_S = 3.0
+MOTION_STOP_VAR_TH = 0.06
+MOTION_STOP_AMP_TH = 0.08
+STATIC_CONFIRM_FRAMES = 8
+MOTION_LABEL_SWITCH_S = 1.2
+STAIRS_SWITCH_HOLD_S = 1.5
+STAIRS_FLIP_MIN_PROBA = 0.62
+STAIRS_FLIP_CONFIRM_FRAMES = 2
+WALK_DIR_VOTE_STEPS = 5
+WALK_DIR_LOCK_MIN_STEPS = 3
+WALK_DIR_SWITCH_CONFIRM_STEPS = 4
+WALK_DIR_CONF_MIN = 0.35
+WALK_DIR_HOLD_S = 1.0
+KNEE_MODE_SUSTAIN_FRAMES = 5
+KNEE_MODE_MIN_HOLD_S = 0.5
 STAND_PSUM_TH = 0.15
-
-# 左右偏重的阈值，按 lr_ratio 判断
-LEAN_LR_TH = 0.12
-
-# ── 坐起（sit-to-stand）────────────────────────────────────────────
-
-# 坐起触发 / 确认阈值（都在压力域，也就是归一化之后的）
 STS_TRIGGER_TH = 0.15
 STS_CONFIRM_TH = 0.25
 STS_CONFIRM_S = 0.8
-
-# 膝盖压力要比坐着的基线高出这么多才算"有要站起来的趋势"
 STS_KNEE_DELTA_TH = 0.08
-
-# STS_TREND_SAMPLES 这段时间内 p_sum 最小到最大要涨这么多才算有上升趋势
 STS_MIN_PSUM_RISE = 0.02
-
-# 看 p_sum 趋势的窗口长度（帧数，在这个窗口里找 min/max）
 STS_TREND_SAMPLES = 10
+_PAD_UNLOADED = SENSOR_MAX
 
-# 单足流走 8 通道自适应模型时，缺的那只脚原始 ADC 用这个值填
-_SINGLE_FOOT_PAD_RAW = 2048.0
+RF_TRAINING_LABELS = {
+    "WALKING_FORWARD", "WALKING_BACKWARD", "STAIRS_UP", "STAIRS_DOWN",
+    "SITTING_NORMAL", "SITTING_CROSSLEGGED", "STANDING_UPRIGHT",
+    "STANDING_LEFT_LEAN", "STANDING_RIGHT_LEAN", "UNKNOWN",
+}
+FALLBACK_BRANCH_MARGIN = 0.03
 
 
 def _snapshot_to_adaptive_debug_dict(s) -> dict:
     return {
         "raw": round(float(s.raw), 2),
-        "baseline_raw": round(float(s.baseline_raw), 2),
-        "baseline_removed": round(float(s.baseline_removed), 4),
         "relative_pressure_ratio": round(float(s.relative_pressure_ratio), 4),
         "adaptive_zscore": round(float(s.adaptive_zscore), 4),
         "current_state": s.stable_state,
-        "confidence": round(float(s.confidence), 4),
-        "dynamic_min_raw": round(float(s.dynamic_min_raw), 2),
-        "dynamic_max_raw": round(float(s.dynamic_max_raw), 2),
     }
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  第二层：MOTION / STATIC
-# ═══════════════════════════════════════════════════════════════════════════
 
 
 class _Layer2MotionStatic:
-    """判 MOTION / STATIC，靠迈步证据 + 幅度迟滞。
-
-    如果第一层是 INACTIVE（站 ↔ 走），在 WALK_EVIDENCE_WINDOW_S
-    这段滚动窗口里必须同时有 WALK_ENTER_MIN_STEPS 次真实抬脚和同样多的
-    膝盖伸直见证，才允许进 MOTION。这么做就是为了把站着身体晃动导致的
-    假迈步压住。
-    """
-
     def __init__(self) -> None:
         self._sub = "STATIC_BRANCH"
         self._up_cnt = 0
@@ -258,6 +119,29 @@ class _Layer2MotionStatic:
         self._reason = "init"
         self._step_events: deque[float] = deque()
         self._knee_extend_events: deque[float] = deque()
+        self._motion_amp_hist: deque[float] = deque(
+            maxlen=max(8, int(round(SAMPLE_HZ * MOTION_ADAPTIVE_WINDOW_S))),
+        )
+        self._last_amp_th = MOTION_MIN_AMPLITUDE
+
+    def _adaptive_motion_th(self, amp: float) -> float:
+        if not np.isfinite(amp):
+            amp = 0.0
+        self._motion_amp_hist.append(float(max(0.0, amp)))
+        if len(self._motion_amp_hist) < 8:
+            self._last_amp_th = MOTION_MIN_AMPLITUDE
+            return self._last_amp_th
+        hist = np.asarray(self._motion_amp_hist, dtype=np.float64)
+        q = float(np.quantile(hist, MOTION_ADAPTIVE_QUANTILE))
+        q_hi = float(np.quantile(hist, MOTION_ADAPTIVE_UPPER_QUANTILE))
+        q_robust = min(q, q_hi)
+        target = np.clip(
+            q_robust * MOTION_ADAPTIVE_GAIN,
+            MOTION_MIN_AMPLITUDE,
+            MOTION_MIN_AMPLITUDE_MAX,
+        )
+        self._last_amp_th += MOTION_ADAPTIVE_EMA_ALPHA * (float(target) - self._last_amp_th)
+        return self._last_amp_th
 
     def _trim(self, dq: deque[float], t: float) -> None:
         cutoff = t - WALK_EVIDENCE_WINDOW_S
@@ -268,10 +152,10 @@ class _Layer2MotionStatic:
         self,
         raw_step: bool,
         recent_step: bool,
-        amp: float,
+        motion_amp: float,
         t: float,
         *,
-        layer1_branch: str = "INACTIVE_BRANCH",
+        knee_low_activity: bool = True,
         knee_extended_now: bool = False,
     ) -> tuple[str, str]:
         if raw_step:
@@ -281,23 +165,20 @@ class _Layer2MotionStatic:
         self._trim(self._step_events, t)
         self._trim(self._knee_extend_events, t)
 
-        evidence = (raw_step or recent_step) and amp >= MOTION_MIN_AMPLITUDE
+        amp_th = self._adaptive_motion_th(motion_amp)
+        evidence = (raw_step or recent_step) and motion_amp >= amp_th
         if evidence:
             self._last_evidence_t = t
 
-        # 只有第一层是 INACTIVE 时才加这个保护：必须同时看到真实迈步 + 膝盖摆动
         walk_guard_ok = True
         walk_guard_reason = ""
-        if layer1_branch == "INACTIVE_BRANCH":
+        if knee_low_activity:
             need = WALK_ENTER_MIN_STEPS
             n_steps = len(self._step_events)
             n_knee = len(self._knee_extend_events)
             walk_guard_ok = (n_steps >= need) and (n_knee >= need)
             if not walk_guard_ok:
-                walk_guard_reason = (
-                    f"walk_guard_waiting(steps={n_steps}/{need},"
-                    f"knee_ext={n_knee}/{need})"
-                )
+                walk_guard_reason = f"walk_guard(steps={n_steps}/{need},knee={n_knee}/{need})"
 
         if self._sub == "STATIC_BRANCH":
             if evidence and walk_guard_ok:
@@ -310,10 +191,9 @@ class _Layer2MotionStatic:
                     self._reason = "motion_confirmed"
             else:
                 self._up_cnt = 0
-                self._reason = walk_guard_reason or "static_no_evidence"
+                self._reason = walk_guard_reason or f"static_no_evidence(amp<{amp_th:.3f})"
             return self._sub, self._reason
 
-        # 进到这里就是已经在 MOTION_BRANCH 里了
         if evidence:
             self._down_cnt = 0
             self._reason = "motion_sustained"
@@ -332,18 +212,48 @@ class _Layer2MotionStatic:
             self._reason = "static_timeout"
         return self._sub, self._reason
 
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  小工具
-# ═══════════════════════════════════════════════════════════════════════════
-
-def raw_to_pressure(raw: float) -> float:
-    return float(np.clip((SENSOR_MAX - raw) / SENSOR_MAX, 0.0, 1.0))
+    @property
+    def current_motion_amp_threshold(self) -> float:
+        return float(self._last_amp_th)
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  EMA 滤波
-# ═══════════════════════════════════════════════════════════════════════════
+class _KneeModeRouter:
+    """Map knee_soft_scores_3 to KNEE_MODES with hold time."""
+
+    def __init__(self) -> None:
+        self._mode: str = "KNEE_LOW_ACTIVITY"
+        self._since_switch = -1e9
+        self._pending: str | None = None
+        self._cnt = 0
+
+    def update(self, w63: np.ndarray, t: float) -> tuple[str, dict[str, float]]:
+        sb, sd, sl = knee_soft_scores_3(w63)
+        idx = knee_mode_argmax((sb, sd, sl))
+        target = KNEE_MODES[idx]
+        info = {
+            "knee_soft_bent": float(sb),
+            "knee_soft_dynamic": float(sd),
+            "knee_soft_low": float(sl),
+        }
+        if target == self._mode:
+            self._pending = None
+            self._cnt = 0
+            return self._mode, info
+        if self._pending != target:
+            self._pending = target
+            self._cnt = 1
+        else:
+            self._cnt += 1
+        if (
+            self._cnt >= KNEE_MODE_SUSTAIN_FRAMES
+            and (t - self._since_switch) >= KNEE_MODE_MIN_HOLD_S
+        ):
+            self._mode = target
+            self._since_switch = t
+            self._pending = None
+            self._cnt = 0
+        return self._mode, info
+
 
 class _EMAFilter:
     def __init__(self, alpha: float = EMA_ALPHA):
@@ -355,52 +265,44 @@ class _EMAFilter:
             self._v = x
         else:
             self._v += self._a * (x - self._v)
-        return self._v
+        return float(self._v)
 
-    @property
-    def value(self) -> float:
-        return 0.0 if self._v is None else self._v
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  自适应迈步检测器（按脚算，Schmitt 阈值自动调）
-#  旧版思路，基于脚跟信号，现在主要当 fallback 和调试用
-# ═══════════════════════════════════════════════════════════════════════════
 
 class _AdaptiveStepDetector:
-    """单脚的迈步检测器，Schmitt 阈值会自己调。
-
-    记一下最近的脚跟峰和谷，攒够 3 步之后用最近
-    ADAPTIVE_HISTORY 个峰 / 谷的平均值重新算上下阈值。
-    这样不管鞋垫里用的是哪种电阻都能自适应。
-    """
-
     def __init__(self) -> None:
         self._low = STEP_INIT_LOW
         self._high = STEP_INIT_HIGH
         self._armed = True
         self._cooldown = 0
         self._prev = 0.0
-
-        # 追峰追谷
         self._recent_peaks: deque[float] = deque(maxlen=ADAPTIVE_HISTORY)
         self._recent_troughs: deque[float] = deque(maxlen=ADAPTIVE_HISTORY)
         self._tracking_val = 0.0
-        self._phase = "seek_peak"   # "seek_peak" | "seek_trough"
+        self._phase = "seek_peak"
 
-    # ── 对外接口 ─────────────────────────────────────────────────────
     def update(self, heel_smooth: float) -> bool:
-        self._track_peaks_troughs(heel_smooth)
-
+        hyst = max(PEAK_TROUGH_HYST, (self._high - self._low) * 0.25)
+        if self._phase == "seek_peak":
+            if heel_smooth > self._tracking_val:
+                self._tracking_val = heel_smooth
+            elif heel_smooth < self._tracking_val - hyst:
+                self._recent_peaks.append(self._tracking_val)
+                self._tracking_val = heel_smooth
+                self._phase = "seek_trough"
+                self._recalc()
+        else:
+            if heel_smooth < self._tracking_val:
+                self._tracking_val = heel_smooth
+            elif heel_smooth > self._tracking_val + hyst:
+                self._recent_troughs.append(self._tracking_val)
+                self._tracking_val = heel_smooth
+                self._phase = "seek_peak"
+                self._recalc()
         step = False
         if self._cooldown > 0:
             self._cooldown -= 1
         else:
-            if (
-                self._armed
-                and self._prev < self._high
-                and heel_smooth >= self._high
-            ):
+            if self._armed and self._prev < self._high and heel_smooth >= self._high:
                 step = True
                 self._armed = False
                 self._cooldown = STEP_COOLDOWN_SAMPLES
@@ -408,30 +310,6 @@ class _AdaptiveStepDetector:
             self._armed = True
         self._prev = heel_smooth
         return step
-
-    @property
-    def thresholds(self) -> tuple[float, float]:
-        return self._low, self._high
-
-    # ── 内部 ─────────────────────────────────────────────────────────
-    def _track_peaks_troughs(self, v: float) -> None:
-        hyst = max(PEAK_TROUGH_HYST, (self._high - self._low) * 0.25)
-        if self._phase == "seek_peak":
-            if v > self._tracking_val:
-                self._tracking_val = v
-            elif v < self._tracking_val - hyst:
-                self._recent_peaks.append(self._tracking_val)
-                self._tracking_val = v
-                self._phase = "seek_trough"
-                self._recalc()
-        else:
-            if v < self._tracking_val:
-                self._tracking_val = v
-            elif v > self._tracking_val + hyst:
-                self._recent_troughs.append(self._tracking_val)
-                self._tracking_val = v
-                self._phase = "seek_peak"
-                self._recalc()
 
     def _recalc(self) -> None:
         if len(self._recent_peaks) < 3 or len(self._recent_troughs) < 3:
@@ -441,37 +319,18 @@ class _AdaptiveStepDetector:
         swing = avg_pk - avg_tr
         if swing < ADAPTIVE_MIN_SWING:
             return
-        self._low  = avg_tr + ADAPTIVE_LOW_FRAC * swing
+        self._low = avg_tr + ADAPTIVE_LOW_FRAC * swing
         self._high = avg_tr + ADAPTIVE_HIGH_FRAC * swing
 
 
-class _StepDetectorV2(_AdaptiveStepDetector):
-    """老代码里有地方 import 这个名字，留个别名兼容一下。"""
-    pass
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  脚底接触迈步检测（按脚走"抬起 → 落地"一次事件）
-# ═══════════════════════════════════════════════════════════════════════════
-
 class _FootContactStepDetector:
-    """按脚底三区压力之和（toe + forefoot + heel）来数脚步。
-
-    状态转移：
-      ON_GROUND  --（连续 N 帧压力 < FOOT_OFF_GROUND_TH）--> LIFTED
-      LIFTED     --（连续 N 帧压力 > FOOT_ON_GROUND_TH ）--> ON_GROUND，记一步
-
-    用连续帧计数 + 两步最小间隔来防抖，避免噪声触发假步。
-    """
-
     def __init__(self) -> None:
-        self._phase = "ON_GROUND"   # "ON_GROUND" | "LIFTED"
+        self._phase = "ON_GROUND"
         self._off_count = 0
         self._on_count = 0
         self._last_step_t = -999.0
 
     def update(self, load: float, t: float) -> bool:
-        """喂一帧数据，返回 True 就表示这一帧踩出了一个有效步（重新落地）。"""
         step = False
         if self._phase == "ON_GROUND":
             if load < FOOT_OFF_GROUND_TH:
@@ -481,7 +340,7 @@ class _FootContactStepDetector:
                     self._on_count = 0
             else:
                 self._off_count = 0
-        elif self._phase == "LIFTED":
+        else:
             if load > FOOT_ON_GROUND_TH:
                 self._on_count += 1
                 if self._on_count >= FOOT_ON_MIN_SAMPLES:
@@ -499,73 +358,143 @@ class _FootContactStepDetector:
         return self._phase
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  方向判断（比较脚尖和脚跟哪个先到峰值）
-# ═══════════════════════════════════════════════════════════════════════════
+class _WalkDirectionTracker:
+    """Fwd/bwd lock from gait votes (step UI only, not RF class)."""
 
-class _DirectionDetector:
-    """脚跟先到峰 → 向前走；脚尖先到峰 → 向后走"""
+    def __init__(self) -> None:
+        self.locked: str = "UNKNOWN"
+        self._votes: deque[str] = deque(maxlen=max(2, WALK_DIR_VOTE_STEPS))
+        self._consec_opp: int = 0
+        self._last_switch_t: float = -1e9
+        self._switch_pending: bool = False
+        self._last_single: str = "N"
+        self._last_f: int = 0
+        self._last_b: int = 0
+        self._last_conf: float = 0.0
 
-    def __init__(self):
-        self._collecting = False
-        self._t0 = 0.0
-        self._buf: list[tuple[float, float, float]] = []
+    @staticmethod
+    def _single_step_vote(g8: dict) -> str:
+        """Single-step F/B/N vote from eight_named_gait_features."""
+        t_h = float(g8.get("heel_peak_time", 0.5))
+        t_ff = float(g8.get("forefoot_peak_time", 0.5))
+        h1 = float(g8.get("heel_first_score", 0.0))
+        f1 = float(g8.get("forefoot_first_score", 0.0))
+        c = float(g8.get("contact_order_confidence", 0.0))
+        if c < WALK_DIR_CONF_MIN:
+            return "N"
+        th = WALK_DIR_CONF_MIN
+        if t_h < t_ff and h1 >= th:
+            return "F"
+        if t_ff < t_h and f1 >= th:
+            return "B"
+        return "N"
 
-    def on_step(self, t: float):
-        self._collecting = True
-        self._t0 = t
-        self._buf.clear()
+    @staticmethod
+    def _plurality(f: int, b: int) -> str:
+        if f > b:
+            return "F"
+        if b > f:
+            return "B"
+        return "N"
 
-    def feed(self, t: float, toe_p: float, heel_p: float) -> str | None:
-        if not self._collecting:
-            return None
-        self._buf.append((t, toe_p, heel_p))
-        if (t - self._t0) < WINDOW_SECONDS:
-            return None
-        self._collecting = False
-        if not self._buf:
-            return "unknown"
-        t_toe = max(self._buf, key=lambda r: r[1])[0]
-        t_heel = max(self._buf, key=lambda r: r[2])[0]
-        if abs(t_heel - t_toe) < 0.02:
-            return "unknown"
-        return "forward" if t_heel < t_toe else "backward"
+    def on_step(
+        self,
+        t: float,
+        g8: dict,
+        *,
+        use_vote: bool,
+    ) -> None:
+        if not use_vote:
+            return
+        sv = self._single_step_vote(g8)
+        self._last_single = sv
+        self._votes.append(sv)
+        f_cnt = sum(1 for v in self._votes if v == "F")
+        b_cnt = sum(1 for v in self._votes if v == "B")
+        self._last_f, self._last_b = f_cnt, b_cnt
+        denom = f_cnt + b_cnt
+        self._last_conf = (max(f_cnt, b_cnt) / denom) if denom else 0.0
 
+        if self.locked == "UNKNOWN":
+            self._consec_opp = 0
+            self._switch_pending = False
+            if f_cnt > b_cnt and f_cnt >= WALK_DIR_LOCK_MIN_STEPS:
+                self.locked = "FORWARD"
+                self._last_switch_t = t
+            elif b_cnt > f_cnt and b_cnt >= WALK_DIR_LOCK_MIN_STEPS:
+                self.locked = "BACKWARD"
+                self._last_switch_t = t
+            return
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  方向投票（最近 K 步少数服从多数）
-# ═══════════════════════════════════════════════════════════════════════════
+        hold_ok = (t - self._last_switch_t) >= WALK_DIR_HOLD_S
+        pl = self._plurality(f_cnt, b_cnt)
 
-class _DirectionVoting:
-    def __init__(self, k: int = VOTE_K_STEPS):
-        self._buf: deque[str] = deque(maxlen=k)
+        if self.locked == "FORWARD":
+            if sv == "B":
+                self._consec_opp += 1
+            else:
+                self._consec_opp = 0
+            want = (
+                pl == "B"
+                and b_cnt > f_cnt
+                and self._consec_opp >= WALK_DIR_SWITCH_CONFIRM_STEPS
+                and hold_ok
+            )
+        elif self.locked == "BACKWARD":
+            if sv == "F":
+                self._consec_opp += 1
+            else:
+                self._consec_opp = 0
+            want = (
+                pl == "F"
+                and f_cnt > b_cnt
+                and self._consec_opp >= WALK_DIR_SWITCH_CONFIRM_STEPS
+                and hold_ok
+            )
+        else:
+            want = False
+            self._consec_opp = 0
 
-    def push(self, d: str):
-        if d != "unknown":
-            self._buf.append(d)
+        self._switch_pending = bool(
+            self.locked in ("FORWARD", "BACKWARD")
+            and self._consec_opp > 0
+            and self._consec_opp < WALK_DIR_SWITCH_CONFIRM_STEPS
+        )
 
-    @property
-    def result(self) -> str:
-        if not self._buf:
-            return "unknown"
-        fwd = sum(1 for d in self._buf if d == "forward")
-        bwd = len(self._buf) - fwd
-        if fwd > bwd:
+        if not want:
+            return
+        if self.locked == "FORWARD":
+            self.locked = "BACKWARD"
+        else:
+            self.locked = "FORWARD"
+        self._last_switch_t = t
+        self._consec_opp = 0
+
+    def to_walk_dir(self) -> str:
+        if self.locked == "FORWARD":
             return "forward"
-        if bwd > fwd:
+        if self.locked == "BACKWARD":
             return "backward"
         return "unknown"
 
+    @property
+    def vote_forward(self) -> int:
+        return self._last_f
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  坐起检测（sit-to-stand）
-# ═══════════════════════════════════════════════════════════════════════════
+    @property
+    def vote_backward(self) -> int:
+        return self._last_b
+
+    @property
+    def path_confidence(self) -> float:
+        return self._last_conf
+
+    @property
+    def switch_pending(self) -> bool:
+        return self._switch_pending
+
 
 class _SitToStandDetector:
-    """坐起这个动作我没用模型，纯靠规则：
-    脚底总压力 + 膝盖相对基线的变化 + p_sum 短时上升趋势。
-    """
-
     def __init__(self) -> None:
         self._phase = "idle"
         self._trigger_t = 0.0
@@ -582,33 +511,20 @@ class _SitToStandDetector:
         knee_baseline: float | None,
         t: float,
     ) -> tuple[bool, bool]:
-        """
-        返回 (force_sit_to_stand, post_complete_standing)。
-        如果第二个是 True，说明 last_duration 刚被赋值，外面应该在这一帧
-        直接给一个站着的候选标签。
-        """
         self._last_p_sum = p_sum
         self._psum_ring.append(p_sum)
         trend_ok = True
         if len(self._psum_ring) >= 3:
             trend_ok = (max(self._psum_ring) - min(self._psum_ring)) >= STS_MIN_PSUM_RISE
-
         is_sitting = sm_state.startswith("SITTING")
         knee_ok = True
         if knee_baseline is not None:
             knee_ok = (p_knee - knee_baseline) >= STS_KNEE_DELTA_TH
-
         if self._phase == "idle":
-            if (
-                is_sitting
-                and p_sum >= STS_TRIGGER_TH
-                and knee_ok
-                and trend_ok
-            ):
+            if is_sitting and p_sum >= STS_TRIGGER_TH and knee_ok and trend_ok:
                 self._phase = "triggered"
                 self._trigger_t = t
             return (False, False)
-
         if self._phase == "triggered":
             if p_sum < STS_TRIGGER_TH * 0.5:
                 self._phase = "idle"
@@ -617,7 +533,6 @@ class _SitToStandDetector:
                 self._phase = "confirming"
                 self._confirm_t = t
             return (True, False)
-
         if self._phase == "confirming":
             if p_sum < STS_CONFIRM_TH:
                 self._phase = "triggered"
@@ -628,7 +543,6 @@ class _SitToStandDetector:
                 self._psum_ring.clear()
                 return (False, True)
             return (True, False)
-
         self._phase = "idle"
         return (False, False)
 
@@ -647,25 +561,8 @@ class _SitToStandDetector:
         return float(self._last_p_sum / th)
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  状态机（带防抖和最短保持时间）
-# ═══════════════════════════════════════════════════════════════════════════
-
-ALL_STATES = {
-    "WALKING_FORWARD", "WALKING_BACKWARD",
-    "STAIRS_UP", "STAIRS_DOWN",
-    "SITTING_NORMAL", "SITTING_CROSSLEGGED",
-    "SIT_TO_STAND",
-    "STANDING_UPRIGHT", "STANDING_LEFT_LEAN", "STANDING_RIGHT_LEAN",
-    "UNKNOWN",
-}
-
-# RF 训练用的标签集合（ALL_STATES 的子集），把 SIT_TO_STAND 去掉，因为那是规则判的
-RF_TRAINING_LABELS = ALL_STATES - {"SIT_TO_STAND"}
-
-
 class _StateMachine:
-    def __init__(self):
+    def __init__(self) -> None:
         self.state = "UNKNOWN"
         self._entered_t = 0.0
 
@@ -678,678 +575,416 @@ class _StateMachine:
         return self.state
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  主类：OnlineRecognizer
-# ═══════════════════════════════════════════════════════════════════════════
+def _sensor_variation_from_w63(w63: np.ndarray) -> float:
+    """Scalar activity from ratio channels: std, |diff|, p2p blend."""
+    if w63.ndim != 3 or w63.shape[0] < 2 or w63.shape[1] < 6:
+        return 0.0
+    r = w63[:, :6, 1].astype(np.float64)  # relative_pressure_ratio
+    std_m = float(np.mean(np.std(r, axis=0)))
+    d1 = float(np.mean(np.abs(np.diff(r, axis=0)))) if r.shape[0] >= 2 else 0.0
+    p2p = float(np.mean(np.max(r, axis=0) - np.min(r, axis=0)))
+    v = 0.35 * std_m + 0.40 * d1 * 1.4 + 0.25 * p2p
+    return float(np.clip(v, 0.0, 1.5))
+
+
+class _EvidenceStateStabilizer:
+    """Holds or switches STATIC vs MOTION RF labels with timing rules."""
+
+    def __init__(self) -> None:
+        self._mode: str = "STATIC"
+        self._enter_motion_cnt: int = 0
+        self._stop_start_t: float | None = None
+        self._motion_held: str | None = None
+        self._motion_pend: str | None = None
+        self._motion_pend_t0: float = 0.0
+        self._static_pend: str | None = None
+        self._static_cnt: int = 0
+        self._static_out: str = "UNKNOWN"
+
+    def _reset_motion_track(self) -> None:
+        self._motion_held = None
+        self._motion_pend = None
+        self._motion_pend_t0 = 0.0
+
+    def _reset_static_track(self) -> None:
+        self._static_pend = None
+        self._static_cnt = 0
+        self._static_out = "UNKNOWN"
+
+    def _normalize_motion_cand(self, c: str) -> str:
+        if c in MOTION_SET:
+            return c
+        if self._motion_held in MOTION_SET:
+            return self._motion_held
+        return c if c in (MOTION_SET | STATIC_SET) else "UNKNOWN"
+
+    @staticmethod
+    def _switch_hold_s(cur: str, pend: str) -> float:
+        if cur in STAIRS_LABELS or pend in STAIRS_LABELS:
+            return STAIRS_SWITCH_HOLD_S
+        return MOTION_LABEL_SWITCH_S
+
+    def _stop_elapsed(self, t: float) -> float:
+        if self._stop_start_t is None:
+            return 0.0
+        return float(t - self._stop_start_t)
+
+    def _pack_dbg(
+        self,
+        *,
+        reason: str,
+        sensor_variation: float,
+        motion_activity_score: float,
+        motion_evidence: bool,
+        stop_candidate: bool,
+        t: float,
+    ) -> dict:
+        md = "MOTION_MODE" if self._mode == "MOTION" else "STATIC_MODE"
+        stop_elapsed_s = self._stop_elapsed(t)
+        mp = self._motion_pend
+        if mp is None:
+            motion_pending_state = "—"
+        else:
+            motion_pending_state = f"{mp}@{t - self._motion_pend_t0:.2f}s"
+        sp = self._static_pend
+        if sp is None:
+            static_pending_state = "—"
+        else:
+            static_pending_state = f"{sp}({self._static_cnt}/{STATIC_CONFIRM_FRAMES})"
+        return {
+            "mode_detector_state": md,
+            "final_state_stabilizer_reason": reason,
+            "sensor_variation": round(sensor_variation, 4),
+            "motion_activity_score": round(motion_activity_score, 4),
+            "motion_evidence": bool(motion_evidence),
+            "stop_candidate": bool(stop_candidate),
+            "stop_elapsed_s": round(stop_elapsed_s, 3),
+            "motion_pending_state": motion_pending_state,
+            "static_pending_state": static_pending_state,
+        }
+
+    def update(
+        self,
+        t: float,
+        amp: float,
+        sensor_var: float,
+        motion_evidence: bool,
+        stop_candidate: bool,
+        static_candidate: str,
+        motion_candidate: str,
+        *,
+        fsts: bool,
+        psts: bool,
+        motion_activity_score: float,
+    ) -> tuple[str, dict]:
+        if fsts:
+            self._mode = "STATIC"
+            self._enter_motion_cnt = 0
+            self._stop_start_t = None
+            self._reset_motion_track()
+            self._reset_static_track()
+            return "SIT_TO_STAND", self._pack_dbg(
+                reason="sit_to_stand_immediate",
+                sensor_variation=sensor_var,
+                motion_activity_score=motion_activity_score,
+                motion_evidence=motion_evidence,
+                stop_candidate=stop_candidate,
+                t=t,
+            )
+
+        if psts:
+            self._enter_motion_cnt = 0
+            self._stop_start_t = None
+            self._reset_motion_track()
+            if motion_candidate in MOTION_SET:
+                self._mode = "MOTION"
+                self._motion_held = motion_candidate
+            else:
+                self._mode = "STATIC"
+            return motion_candidate, self._pack_dbg(
+                reason="psts_bypass",
+                sensor_variation=sensor_var,
+                motion_activity_score=motion_activity_score,
+                motion_evidence=motion_evidence,
+                stop_candidate=stop_candidate,
+                t=t,
+            )
+
+        if self._mode == "MOTION":
+            if stop_candidate:
+                if self._stop_start_t is None:
+                    self._stop_start_t = t
+                if self._stop_elapsed(t) >= MOTION_STOP_RELEASE_S:
+                    self._mode = "STATIC"
+                    self._stop_start_t = None
+                    self._reset_motion_track()
+                    self._enter_motion_cnt = 0
+                    self._reset_static_track()
+            else:
+                self._stop_start_t = None
+
+        if self._mode == "MOTION":
+            m_in = self._normalize_motion_cand(motion_candidate)
+            reason: str
+            if m_in not in MOTION_SET:
+                reason = (
+                    "hold_motion_non_motion_candidate"
+                    if m_in not in (MOTION_SET | STATIC_SET)
+                    else "hold_motion_static_like_rf"
+                )
+                out = self._motion_held if self._motion_held in MOTION_SET else m_in
+                return out, self._pack_dbg(
+                    reason=reason,
+                    sensor_variation=sensor_var,
+                    motion_activity_score=motion_activity_score,
+                    motion_evidence=motion_evidence,
+                    stop_candidate=stop_candidate,
+                    t=t,
+                )
+
+            if self._motion_held is None or self._motion_held not in MOTION_SET:
+                self._motion_held = m_in
+                self._motion_pend = None
+                reason = "motion_accept_initial"
+                return self._motion_held, self._pack_dbg(
+                    reason=reason,
+                    sensor_variation=sensor_var,
+                    motion_activity_score=motion_activity_score,
+                    motion_evidence=motion_evidence,
+                    stop_candidate=stop_candidate,
+                    t=t,
+                )
+
+            if m_in == self._motion_held:
+                self._motion_pend = None
+                reason = "motion_hold_same"
+                return self._motion_held, self._pack_dbg(
+                    reason=reason,
+                    sensor_variation=sensor_var,
+                    motion_activity_score=motion_activity_score,
+                    motion_evidence=motion_evidence,
+                    stop_candidate=stop_candidate,
+                    t=t,
+                )
+
+            hold_s = self._switch_hold_s(self._motion_held, m_in)
+            if self._motion_pend != m_in:
+                self._motion_pend = m_in
+                self._motion_pend_t0 = t
+                reason = "motion_switch_timer_reset"
+                return self._motion_held, self._pack_dbg(
+                    reason=reason,
+                    sensor_variation=sensor_var,
+                    motion_activity_score=motion_activity_score,
+                    motion_evidence=motion_evidence,
+                    stop_candidate=stop_candidate,
+                    t=t,
+                )
+
+            if (t - self._motion_pend_t0) >= hold_s:
+                self._motion_held = m_in
+                self._motion_pend = None
+                reason = "motion_switch_confirmed"
+                return self._motion_held, self._pack_dbg(
+                    reason=reason,
+                    sensor_variation=sensor_var,
+                    motion_activity_score=motion_activity_score,
+                    motion_evidence=motion_evidence,
+                    stop_candidate=stop_candidate,
+                    t=t,
+                )
+
+            reason = "motion_switch_hold"
+            return self._motion_held, self._pack_dbg(
+                reason=reason,
+                sensor_variation=sensor_var,
+                motion_activity_score=motion_activity_score,
+                motion_evidence=motion_evidence,
+                stop_candidate=stop_candidate,
+                t=t,
+            )
+
+        enter_gate = motion_evidence and (
+            sensor_var >= MOTION_ENTER_VAR_TH or amp >= MOTION_ENTER_AMP_TH
+        )
+        if enter_gate:
+            self._enter_motion_cnt += 1
+        else:
+            self._enter_motion_cnt = 0
+
+        if self._enter_motion_cnt >= MOTION_ENTER_CONFIRM_FRAMES:
+            self._mode = "MOTION"
+            self._enter_motion_cnt = 0
+            self._stop_start_t = None
+            m0 = self._normalize_motion_cand(motion_candidate)
+            if m0 in MOTION_SET:
+                self._motion_held = m0
+            else:
+                self._motion_held = None
+            self._motion_pend = None
+            if self._motion_held in MOTION_SET:
+                return self._motion_held, self._pack_dbg(
+                    reason="entered_motion_from_static",
+                    sensor_variation=sensor_var,
+                    motion_activity_score=motion_activity_score,
+                    motion_evidence=motion_evidence,
+                    stop_candidate=stop_candidate,
+                    t=t,
+                )
+            reason = "entered_motion_await_rf_motion_label"
+            return "UNKNOWN", self._pack_dbg(
+                reason=reason,
+                sensor_variation=sensor_var,
+                motion_activity_score=motion_activity_score,
+                motion_evidence=motion_evidence,
+                stop_candidate=stop_candidate,
+                t=t,
+            )
+
+        if static_candidate == self._static_pend:
+            self._static_cnt += 1
+        else:
+            self._static_pend = static_candidate
+            self._static_cnt = 1
+        if self._static_cnt >= STATIC_CONFIRM_FRAMES and self._static_pend in STATIC_SET:
+            self._static_out = self._static_pend
+        if self._static_cnt < STATIC_CONFIRM_FRAMES:
+            out = self._static_out if self._static_out in STATIC_SET else (
+                self._static_pend if self._static_pend in STATIC_SET else "UNKNOWN"
+            )
+            reason = "static_confirm_in_progress"
+        else:
+            out = self._static_out if self._static_out in STATIC_SET else self._static_pend
+            reason = "static_confirmed"
+        if out not in STATIC_SET and self._static_pend in STATIC_SET:
+            out = self._static_pend
+        return out, self._pack_dbg(
+            reason=reason,
+            sensor_variation=sensor_var,
+            motion_activity_score=motion_activity_score,
+            motion_evidence=motion_evidence,
+            stop_candidate=stop_candidate,
+            t=t,
+        )
+
 
 class OnlineRecognizer:
-    """每来一帧就调一次 update() 或 update_bilateral()。
-
-    返回 dict，字段有：
-      state, step_event, walk_dir, counters, sts_last_duration_s, debug
-    """
-
     _STEP_STATES = {"WALKING_FORWARD", "WALKING_BACKWARD", "STAIRS_UP", "STAIRS_DOWN"}
 
-    def __init__(
-        self,
-        calibration: "object | str | None" = "auto",
-    ):
-        """
-        参数说明
-        ----------
-        calibration : PersonalCalibration | str（路径）| "auto" | None
-            * 直接传 PersonalCalibration 对象 — 就用它。
-            * 传字符串 — 当成 JSON 路径，可能是离线自动标定的结果，也可能是
-              界面上那个两步在线标定向导生成的。
-            * "auto"（默认）— 尝试从当前工作目录读 personal_calibration.json；
-              找不到就当 None，安静降级。
-            * None — 完全关掉个人标定（老行为，EWMA bank 直接吃原始 ADC）。
-
-            第一层的膝盖门控（严格 4095 规则，KNEE_RAW_STRAIGHT_TH）永远读的是
-            标定之前的原始 ADC，所以"单腿 raw ≠ 4095 → ACTIVE"这条规则不会被
-            这个参数影响。
-        """
-        # 个人标定，可选
+    def __init__(self, calibration: object | str | None = "auto") -> None:
         self._calibration = self._resolve_calibration(calibration)
-        # 左脚四通道 EMA
-        self._f_toe  = _EMAFilter(EMA_ALPHA)
-        self._f_ff   = _EMAFilter(EMA_ALPHA)
-        self._f_heel = _EMAFilter(EMA_ALPHA)
-        self._f_knee = _EMAFilter(EMA_ALPHA)
-
-        # 右脚四通道 EMA（只在 update_bilateral 里用）
-        self._f_toe_r  = _EMAFilter(EMA_ALPHA)
-        self._f_ff_r   = _EMAFilter(EMA_ALPHA)
-        self._f_heel_r = _EMAFilter(EMA_ALPHA)
-        self._f_knee_r = _EMAFilter(EMA_ALPHA)
-
-        # 脚跟版迈步检测（旧方案，兜底 + 调试）
+        self._f_lf = _EMAFilter()
+        self._f_lh = _EMAFilter()
+        self._f_lk = _EMAFilter()
+        self._f_rf = _EMAFilter()
+        self._f_rh = _EMAFilter()
+        self._f_rk = _EMAFilter()
         self._heel_step_l = _EMAFilter(HEEL_STEP_EMA_ALPHA)
         self._heel_step_r = _EMAFilter(HEEL_STEP_EMA_ALPHA)
-        self._step_det_l  = _AdaptiveStepDetector()
-        self._step_det_r  = _AdaptiveStepDetector()
-        self._step_det    = _AdaptiveStepDetector()   # 单脚 fallback
-
-        # 脚底接触迈步检测（双足主用）
-        self._contact_det_l      = _FootContactStepDetector()
-        self._contact_det_r      = _FootContactStepDetector()
-        self._contact_det_single = _FootContactStepDetector()
-
-        # 方向
-        self._dir_det  = _DirectionDetector()
-        self._dir_vote = _DirectionVoting(VOTE_K_STEPS)
+        self._step_det_l = _AdaptiveStepDetector()
+        self._step_det_r = _AdaptiveStepDetector()
+        self._step_det = _AdaptiveStepDetector()
+        self._contact_l = _FootContactStepDetector()
+        self._contact_r = _FootContactStepDetector()
+        self._walk_dir = _WalkDirectionTracker()
         self._last_valid_walk_dir: str | None = None
-
-        # 坐起
         self._sts_det = _SitToStandDetector()
-
-        # 状态机
         self._sm = _StateMachine()
-
-        # 四分支 RF 模型集合（默认从工作目录下加载 *.joblib）
         self._branch_models = BranchRFEnsemble()
         self._layer2 = _Layer2MotionStatic()
-        self._last_adaptive_snaps: list | None = None
-
         self._counters = {
-            "forward_steps":  0,
-            "backward_steps": 0,
-            "up_steps":       0,
-            "down_steps":     0,
-            "total_steps":    0,
+            "forward_steps": 0, "backward_steps": 0, "up_steps": 0,
+            "down_steps": 0, "total_steps": 0,
         }
         self._last_step_t = 0.0
-
-        # 翘腿检测用的膝盖基线，用最开始 N 帧学一个值
         self._knee_baseline: float | None = None
         self._knee_init_buf: list[float] = []
-
-        # 在线自适应预处理，8 通道（单脚路径会把另一只脚补上）。
-        # 如果标定里带了全局统计量，就把每个通道都种到那套 baseline /
-        # 压力范围 / 均值 / 方差上，保证推理看到的数值分布和训练时一致。
-        # 如果标定里只有 [min_raw, max_raw]（老版本或者 identity 标定），
-        # 就退化成纯 EWMA 跑。
         _calib = self._calibration
         _seeds = None
         if _calib is not None and getattr(_calib, "has_global_stats", False):
             _seeds = _calib.to_channel_seeds()
         self._adapt_bank = DualFootAdaptiveBank(seeds=_seeds)
-
-        # 喂给 ML 滑窗的压力 / 特征历史：
-        # 老版是 4 或 8 个 float（压力），adaptive_v2 是 24 个 float（8 通道 × [br, ratio, z]）
         self._p_hist: deque[np.ndarray] = deque(
             maxlen=max(ML_WINDOW_SIZE, int(SAMPLE_HZ * 2)),
         )
-        self._motion_amp_hist: deque[float] = deque(maxlen=max(8, int(SAMPLE_HZ * 0.6)))
-        self._zone_contact_state = {"toe": False, "forefoot": False, "heel": False}
+        self._ff_heel_motion_hist: deque[float] = deque(
+            maxlen=max(8, int(SAMPLE_HZ * 0.6)),
+        )
+        self._zone_state = {"forefoot": False, "heel": False}
         self._zone_event_hist: deque[tuple[str, str, float]] = deque(maxlen=24)
+        self._knee_router = _KneeModeRouter()
+        self._mode_stabil = _EvidenceStateStabilizer()
+        self._state_gate_blocked_total = 0
+        self._state_gate_pass_total = 0
+        self._stairs_flip_pending: str | None = None
+        self._stairs_flip_pending_cnt = 0
 
-        # 第一层膝盖门控（严格 4095 + 防抖 + 最短保持）
-        self._layer1_branch = "INACTIVE_BRANCH"
-        self._knee_gate_sustain_cnt = 0
-        self._knee_gate_release_cnt = 0
-        self._layer1_last_switch_t = -999.0
-
-    def _knee_gate_instant_active(self, min_raw_knee: float) -> bool:
-        """严格 4095 规则：只要有一只膝盖没顶到 4095，瞬时判 ACTIVE。
-
-        min_raw_knee = min(raw_knee_l, raw_knee_r)；单脚路径会把缺的那侧
-        填成 4095，规则就自动退化成只看一只膝盖。
-        raw ADC >= KNEE_RAW_STRAIGHT_TH 就当是"直的"（差不多到 4095）。
-        """
-        return float(min_raw_knee) < KNEE_RAW_STRAIGHT_TH
-
-    def _update_layer1_knee_gate(
-        self, min_raw_knee: float, t: float,
-    ) -> tuple[str, dict[str, object]]:
-        """带防抖的第一层门控：sustain + release 计数 + 最短保持时间。"""
-        cond = self._knee_gate_instant_active(min_raw_knee)
-        phase = "inactive"
-        hold_ok = (t - self._layer1_last_switch_t) >= KNEE_GATE_MIN_HOLD_S
-
-        if self._layer1_branch == "INACTIVE_BRANCH":
-            if cond:
-                self._knee_gate_sustain_cnt += 1
-                self._knee_gate_release_cnt = 0
-                if self._knee_gate_sustain_cnt >= KNEE_GATE_SUSTAIN_SAMPLES and hold_ok:
-                    self._layer1_branch = "ACTIVE_BRANCH"
-                    self._knee_gate_sustain_cnt = 0
-                    self._layer1_last_switch_t = t
-                    phase = "active"
-                else:
-                    phase = "arming" if hold_ok else "locked_inactive"
-            else:
-                self._knee_gate_sustain_cnt = 0
-                self._knee_gate_release_cnt = 0
-                phase = "inactive"
-        else:
-            if not cond:
-                self._knee_gate_release_cnt += 1
-                self._knee_gate_sustain_cnt = 0
-                if self._knee_gate_release_cnt >= KNEE_GATE_RELEASE_SAMPLES and hold_ok:
-                    self._layer1_branch = "INACTIVE_BRANCH"
-                    self._knee_gate_release_cnt = 0
-                    self._layer1_last_switch_t = t
-                    phase = "inactive"
-                else:
-                    phase = "releasing" if hold_ok else "locked_active"
-            else:
-                self._knee_gate_release_cnt = 0
-                phase = "active"
-
-        info: dict[str, object] = {
-            "knee_gate_phase": phase,
-            "knee_gate_min_raw": round(float(min_raw_knee), 1),
-            "knee_gate_straight_th": float(KNEE_RAW_STRAIGHT_TH),
-            "knee_gate_sustain_cnt": int(self._knee_gate_sustain_cnt),
-            "knee_gate_sustain_need": int(KNEE_GATE_SUSTAIN_SAMPLES),
-            "knee_gate_release_cnt": int(self._knee_gate_release_cnt),
-            "knee_gate_release_need": int(KNEE_GATE_RELEASE_SAMPLES),
-            "knee_gate_min_hold_s": float(KNEE_GATE_MIN_HOLD_S),
-        }
-        return self._layer1_branch, info
-
-    def _compute_min_knee_raw(
-        self,
-        raw_knee_l: float,
-        raw_knee_r: float,
-        *,
-        single_foot: bool = False,
-    ) -> float:
-        """第一层用的指标：两侧膝盖 raw ADC 的最小值，也就是弯得最厉害那一侧。"""
-        if single_foot:
-            return float(raw_knee_l)
-        return float(min(raw_knee_l, raw_knee_r))
-
-    @staticmethod
-    def _resolve_calibration(arg):
-        """把构造函数里的 calibration= 参数统一解析成 PersonalCalibration
-        或者 None。离线和在线两套路径都走这里，保证行为一致。
-        """
+    def _resolve_calibration(self, arg):
         if arg is None:
             return None
-        try:
-            import personal_calibration as _pc
-        except Exception as exc:       # pragma: no cover — 兜底，理论上不会走到
-            print(f"[OnlineRecognizer] personal_calibration unavailable: {exc}")
-            return None
-        if isinstance(arg, _pc.PersonalCalibration):
+        import personal_calibration as pc
+        if isinstance(arg, pc.PersonalCalibration):
             return arg
         if arg == "auto":
-            calib = _pc.load_default_calibration((".",))
-            if calib is not None:
-                print(f"[OnlineRecognizer] loaded calibration "
-                      f"(source={calib.source!r}, subject={calib.subject!r})")
-            return calib
+            base = os.path.dirname(os.path.abspath(__file__))
+            c = pc.load_default_calibration((".", base))
+            return c
         if isinstance(arg, str):
-            return _pc.PersonalCalibration.load_json(arg)
-        raise TypeError(f"Unsupported calibration argument type: {type(arg)!r}")
+            return pc.PersonalCalibration.load_json(arg)
+        raise TypeError(f"bad calibration type {type(arg)!r}")
 
-    def _calibrate_raw8(self, raw8: np.ndarray) -> np.ndarray:
-        """如果加载了个人标定，就按每个通道的 [min, max] 线性映射到 [0, 4095]。
-        注意第一层膝盖门控不走这里，它读的是未标定的 raw，保证严格 4095
-        规则在标定之后还成立。
-        """
+    def _calibrate_raw6(self, raw6: np.ndarray) -> np.ndarray:
         if self._calibration is None:
-            return raw8
-        return np.asarray(
-            self._calibration.normalize_to_adc(raw8), dtype=np.float64,
-        )
+            return raw6
+        return np.asarray(self._calibration.normalize_to_adc(raw6), dtype=np.float64)
 
-    def _branch_key_from_layers(self, active: bool, motion_sub: str) -> str:
-        if active:
-            return (
-                "active_motion"
-                if motion_sub == "MOTION_BRANCH"
-                else "active_static"
-            )
-        return (
-            "inactive_motion"
-            if motion_sub == "MOTION_BRANCH"
-            else "inactive_static"
-        )
+    def _branch_key(self, knee_mode: str, motion_sub: str) -> str:
+        if knee_mode == "KNEE_STATIC_BENT":
+            return "sitting"
+        if knee_mode == "KNEE_DYNAMIC_ACTIVE":
+            return "stairs"
+        if motion_sub == "MOTION_BRANCH":
+            return "walking"
+        return "standing"
 
-    def _hierarchical_rf_predict(
-        self,
-        branch_key: str,
-        sign: dict[str, object],
-        left_load: float,
-        right_load: float,
-        lr_ratio: float,
-        p_sum: float,
-    ) -> tuple[str, float, str, str]:
-        fname = BRANCH_TO_FILE.get(branch_key, "")
-        b = self._branch_models.bundle(branch_key)
-        if not b.available:
-            return "UNKNOWN", 0.0, "model_missing", fname
-        aux = build_auxiliary_vector(sign, left_load, right_load, lr_ratio, p_sum)
+    def _rf_predict(self, br: str) -> tuple[str, float, str, str]:
+        """Predict from deque history; prefer _rf_predict_from_feat in hot path."""
         win = np.array(list(self._p_hist)[-ML_WINDOW_SIZE:])
-        if win.ndim != 2 or win.shape[1] != 24:
-            return "UNKNOWN", 0.0, "window_not_adaptive_v2", fname
-        feat = build_full_feature_vector(win, aux)
+        if win.ndim != 2 or win.shape[1] != 18 or win.shape[0] < ML_WINDOW_SIZE:
+            return "UNKNOWN", 0.0, "window_not_ready", ""
+        w63 = win.reshape(ML_WINDOW_SIZE, 6, 3)
+        feat = build_full_feature_vector_from_window(w63)
         if feat is None:
-            return "UNKNOWN", 0.0, "feature_error", fname
+            return "UNKNOWN", 0.0, "feature_error", ""
+        return self._rf_predict_from_feat(br, feat)
+
+    def _rf_predict_from_feat(
+        self, br: str, feat: np.ndarray
+    ) -> tuple[str, float, str, str]:
+        b = self._branch_models.bundle(br)
+        if not b.available:
+            return "UNKNOWN", 0.0, "model_missing", BRANCH_TO_FILE.get(br, "")
         lab, pr, rj = b.predict(feat)
-        return lab, float(pr), rj, fname
+        return lab, float(pr), rj, b.path or ""
 
-    # ── 对外 API ──────────────────────────────────────────────────────
-
-    def update(
+    def _ff_heel_only_amplitude(
         self,
-        raw_toe: float,
-        raw_forefoot: float,
-        raw_heel: float,
-        raw_knee: float,
-        t: float | None = None,
-    ) -> dict:
-        """单脚更新（4 通道）。"""
-        if t is None:
-            t = time.monotonic()
-
-        adaptive_dbg: dict[str, dict] = {}
-        raw8 = np.array(
-            [
-                raw_toe,
-                raw_forefoot,
-                raw_heel,
-                raw_knee,
-                _SINGLE_FOOT_PAD_RAW,
-                _SINGLE_FOOT_PAD_RAW,
-                _SINGLE_FOOT_PAD_RAW,
-                _SINGLE_FOOT_PAD_RAW,
-            ],
-            dtype=np.float64,
-        )
-        raw8_calib = self._calibrate_raw8(raw8)
-        _flat24, snaps = self._adapt_bank.update(raw8_calib)
-        self._last_adaptive_snaps = list(snaps)
-        p_toe = self._f_toe.update(snaps[0].relative_pressure_ratio)
-        p_ff = self._f_ff.update(snaps[1].relative_pressure_ratio)
-        p_heel = self._f_heel.update(snaps[2].relative_pressure_ratio)
-        p_knee = self._f_knee.update(snaps[3].relative_pressure_ratio)
-        p_sum = p_toe + p_ff + p_heel
-        self._p_hist.append(_flat24)
-        for nm, sn in zip(CHANNEL_NAMES_DUAL, snaps):
-            adaptive_dbg[nm] = _snapshot_to_adaptive_debug_dict(sn)
-
-        if self._knee_baseline is None:
-            self._knee_init_buf.append(p_knee)
-            if len(self._knee_init_buf) >= 30:
-                self._knee_baseline = float(np.mean(self._knee_init_buf))
-        min_raw_knee = self._compute_min_knee_raw(raw_knee, 0.0, single_foot=True)
-        layer1, knee_gate_info = self._update_layer1_knee_gate(min_raw_knee, t)
-        knee_extended_now = float(raw_knee) >= WALK_KNEE_EXTEND_RAIL_TH
-        self._update_zone_sequence(p_toe, p_ff, p_heel, t)
-
-        contact_step = self._contact_det_single.update(p_sum, t)
-        step_source: str | None = "single_contact" if contact_step else None
-        heel_smooth = self._heel_step_l.update(p_heel)
-        heel_step = self._step_det.update(heel_smooth)
-        raw_step = contact_step
-        if not raw_step and heel_step:
-            raw_step = True
-            step_source = "heel_fallback"
-
-        if raw_step:
-            self._dir_det.on_step(t)
-            self._last_step_t = t
-
-        per_step_dir = self._dir_det.feed(t, p_toe, p_heel)
-        if per_step_dir is not None:
-            self._dir_vote.push(per_step_dir)
-        walk_dir = self._dir_vote.result
-        if walk_dir in ("forward", "backward"):
-            self._last_valid_walk_dir = walk_dir
-
-        recent_step = (t - self._last_step_t) < WALK_TIMEOUT_S
-        amp = self._estimate_motion_amplitude(p_toe, p_ff, p_heel, p_knee)
-        layer2, layer2_reason = self._layer2.update(
-            raw_step,
-            recent_step,
-            amp,
-            t,
-            layer1_branch=layer1,
-            knee_extended_now=knee_extended_now,
-        )
-        sign = self._gait_signature_from_pressures(
-            p_toe, p_ff, p_heel, p_knee,
-        )
-        br_key = self._branch_key_from_layers(
-            layer1 == "ACTIVE_BRANCH", layer2,
-        )
-        cand, rf_p, rf_rej, rf_name = self._hierarchical_rf_predict(
-            br_key,
-            sign,
-            p_sum,
-            0.0,
-            0.0,
-            p_sum,
-        )
-
-        force_sts, post_sts = self._sts_det.update(
-            p_sum, p_knee, self._sm.state, self._knee_baseline, t,
-        )
-        if post_sts:
-            candidate = "STANDING_UPRIGHT"
-        elif force_sts:
-            candidate = "SIT_TO_STAND"
-        else:
-            candidate = cand
-
-        immediate = force_sts or post_sts
-        state = self._sm.propose(candidate, t, immediate=immediate)
-
-        step_event = False
-        if raw_step and state in self._STEP_STATES:
-            step_event = True
-            self._counters["total_steps"] += 1
-            if state == "STAIRS_UP":
-                self._counters["up_steps"] += 1
-            elif state == "STAIRS_DOWN":
-                self._counters["down_steps"] += 1
-            elif state == "WALKING_FORWARD":
-                self._counters["forward_steps"] += 1
-            elif state == "WALKING_BACKWARD":
-                self._counters["backward_steps"] += 1
-
-        dbg = {
-            "p_toe":  round(p_toe, 3),
-            "p_ff":   round(p_ff, 3),
-            "p_heel": round(p_heel, 3),
-            "p_knee": round(p_knee, 3),
-            "p_sum":  round(p_sum, 3),
-            "left_load":          round(p_sum, 3),
-            "right_load":         0.0,
-            "lr_ratio":           0.0,
-            "last_valid_walk_dir": self._last_valid_walk_dir,
-            "step_source":        step_source,
-            "left_foot_phase":    self._contact_det_single.phase,
-            "right_foot_phase":   None,
-            "raw_dir":  per_step_dir,
-            "layer1_branch":      layer1,
-            "layer2_subbranch":   layer2,
-            "branch_rf_key":      br_key,
-            "branch_rf_file":     rf_name,
-            "ml_label":           cand,
-            "knee_min_raw":       round(min_raw_knee, 1),
-            "layer2_reason":    layer2_reason,
-            "rf_proba":           round(rf_p, 4),
-            "rf_reject":          rf_rej,
-            "sts_phase": self._sts_det.phase,
-            "sts_trigger_level": round(self._sts_det.trigger_level, 3),
-            "sts_confirm_level": round(self._sts_det.confirm_level, 3),
-            "ml_feature_mode": "branch_adaptive_v2",
-        }
-        dbg.update(knee_gate_info)
-        dbg.update(sign)
-        if adaptive_dbg:
-            dbg["adaptive"] = adaptive_dbg
-        return {
-            "state":              state,
-            "step_event":         step_event,
-            "walk_dir":           walk_dir,
-            "counters":           dict(self._counters),
-            "sts_last_duration_s": self._sts_det.last_duration,
-            "debug": dbg,
-        }
-
-    def update_bilateral(
-        self,
-        raw_left: tuple[float, float, float, float],
-        raw_right: tuple[float, float, float, float],
-        t: float | None = None,
-    ) -> dict:
-        """
-        双足融合：左脚 (toe, forefoot, heel, knee)，右脚同样顺序。
-        迈步主要靠脚底接触检测（抬起 → 落地）按脚走。
-        """
-        if t is None:
-            t = time.monotonic()
-
-        lt, lf, lh, lk = raw_left
-        rt, rf, rh, rk = raw_right
-
-        adaptive_dbg: dict[str, dict] = {}
-        raw8 = np.array([lt, lf, lh, lk, rt, rf, rh, rk], dtype=np.float64)
-        raw8_calib = self._calibrate_raw8(raw8)
-        _flat24, snaps = self._adapt_bank.update(raw8_calib)
-        self._last_adaptive_snaps = list(snaps)
-        p_toe_l = self._f_toe.update(snaps[0].relative_pressure_ratio)
-        p_ff_l = self._f_ff.update(snaps[1].relative_pressure_ratio)
-        p_heel_l = self._f_heel.update(snaps[2].relative_pressure_ratio)
-        p_knee_l = self._f_knee.update(snaps[3].relative_pressure_ratio)
-        p_toe_r = self._f_toe_r.update(snaps[4].relative_pressure_ratio)
-        p_ff_r = self._f_ff_r.update(snaps[5].relative_pressure_ratio)
-        p_heel_r = self._f_heel_r.update(snaps[6].relative_pressure_ratio)
-        p_knee_r = self._f_knee_r.update(snaps[7].relative_pressure_ratio)
-        self._p_hist.append(_flat24)
-        for nm, sn in zip(CHANNEL_NAMES_DUAL, snaps):
-            adaptive_dbg[nm] = _snapshot_to_adaptive_debug_dict(sn)
-
-        left_load = p_toe_l + p_ff_l + p_heel_l
-        right_load = p_toe_r + p_ff_r + p_heel_r
-        p_sum = left_load + right_load
-        p_knee_avg = 0.5 * (p_knee_l + p_knee_r)
-        lr_ratio = (left_load - right_load) / (left_load + right_load + 1e-9)
-
-        if self._knee_baseline is None:
-            self._knee_init_buf.append(p_knee_avg)
-            if len(self._knee_init_buf) >= 30:
-                self._knee_baseline = float(np.mean(self._knee_init_buf))
-        min_raw_knee = self._compute_min_knee_raw(lk, rk)
-        layer1, knee_gate_info = self._update_layer1_knee_gate(min_raw_knee, t)
-        # 膝盖伸直见证：两只膝盖里只要有一只摆到 4095 轨就算（摆腿阶段）
-        knee_extended_now = max(float(lk), float(rk)) >= WALK_KNEE_EXTEND_RAIL_TH
-        dom_left = left_load >= right_load
-        dom_toe = p_toe_l if dom_left else p_toe_r
-        dom_ff = p_ff_l if dom_left else p_ff_r
-        dom_heel = p_heel_l if dom_left else p_heel_r
-        self._update_zone_sequence(dom_toe, dom_ff, dom_heel, t)
-
-        # 主用：脚底接触迈步检测
-        step_l = self._contact_det_l.update(left_load, t)
-        step_r = self._contact_det_r.update(right_load, t)
-        contact_step = step_l or step_r
-        step_source: str | None = None
-        if step_l:
-            step_source = "left_contact"
-        elif step_r:
-            step_source = "right_contact"
-
-        # 备用：脚跟版迈步检测（fallback + 调试）
-        sl = self._heel_step_l.update(p_heel_l)
-        sr = self._heel_step_r.update(p_heel_r)
-        heel_step_l = self._step_det_l.update(sl)
-        heel_step_r = self._step_det_r.update(sr)
-        heel_step = heel_step_l or heel_step_r
-
-        raw_step = contact_step
-        if not raw_step and heel_step:
-            raw_step = True
-            step_source = "heel_fallback"
-
-        if raw_step:
-            self._last_step_t = t
-            self._dir_det.on_step(t)
-
-        # 方向判断
-        per_step_dir = self._dir_det.feed(
-            t, max(p_toe_l, p_toe_r), max(p_heel_l, p_heel_r),
-        )
-        if per_step_dir is not None:
-            self._dir_vote.push(per_step_dir)
-        walk_dir = self._dir_vote.result
-        if walk_dir in ("forward", "backward"):
-            self._last_valid_walk_dir = walk_dir
-
-        recent_step = (t - self._last_step_t) < WALK_TIMEOUT_S
-        amp = self._estimate_motion_amplitude(
-            max(p_toe_l, p_toe_r),
-            max(p_ff_l, p_ff_r),
-            max(p_heel_l, p_heel_r),
-            p_knee_avg,
-        )
-        layer2, layer2_reason = self._layer2.update(
-            raw_step,
-            recent_step,
-            amp,
-            t,
-            layer1_branch=layer1,
-            knee_extended_now=knee_extended_now,
-        )
-        sign = self._gait_signature_from_pressures(
-            dom_toe, dom_ff, dom_heel, p_knee_avg,
-        )
-        br_key = self._branch_key_from_layers(
-            layer1 == "ACTIVE_BRANCH", layer2,
-        )
-        cand, rf_p, rf_rej, rf_name = self._hierarchical_rf_predict(
-            br_key,
-            sign,
-            left_load,
-            right_load,
-            lr_ratio,
-            p_sum,
-        )
-
-        force_sts, post_sts = self._sts_det.update(
-            p_sum, p_knee_avg, self._sm.state, self._knee_baseline, t,
-        )
-        if post_sts:
-            candidate = self._classify_standing_bilateral(left_load, right_load)
-        elif force_sts:
-            candidate = "SIT_TO_STAND"
-        else:
-            candidate = cand
-
-        immediate = force_sts or post_sts
-        state = self._sm.propose(candidate, t, immediate=immediate)
-
-        # 计步只在行走 / 爬楼这几个状态下累加，站着或坐着的抖动不算
-        step_event = False
-        if raw_step and state in self._STEP_STATES:
-            step_event = True
-            self._counters["total_steps"] += 1
-            if state == "STAIRS_UP":
-                self._counters["up_steps"] += 1
-            elif state == "STAIRS_DOWN":
-                self._counters["down_steps"] += 1
-            elif state == "WALKING_FORWARD":
-                self._counters["forward_steps"] += 1
-            elif state == "WALKING_BACKWARD":
-                self._counters["backward_steps"] += 1
-
-        th_l = self._step_det_l.thresholds
-        th_r = self._step_det_r.thresholds
-        dbg = {
-            "p_toe_l":          round(p_toe_l, 3),
-            "p_ff_l":           round(p_ff_l, 3),
-            "p_heel_l":         round(p_heel_l, 3),
-            "p_knee_l":         round(p_knee_l, 3),
-            "p_toe_r":          round(p_toe_r, 3),
-            "p_ff_r":           round(p_ff_r, 3),
-            "p_heel_r":         round(p_heel_r, 3),
-            "p_knee_r":         round(p_knee_r, 3),
-            "p_sum":            round(p_sum, 3),
-            "left_load":        round(left_load, 3),
-            "right_load":       round(right_load, 3),
-            "lr_ratio":         round(lr_ratio, 3),
-            "last_valid_walk_dir": self._last_valid_walk_dir,
-            "step_source":      step_source,
-            "left_foot_phase":  self._contact_det_l.phase,
-            "right_foot_phase": self._contact_det_r.phase,
-            "heel_combined":    round(max(sl, sr), 3),
-            "heel_smooth_l":    round(sl, 3),
-            "heel_smooth_r":    round(sr, 3),
-            "step_th_l":        (round(th_l[0], 3), round(th_l[1], 3)),
-            "step_th_r":        (round(th_r[0], 3), round(th_r[1], 3)),
-            "raw_dir":          per_step_dir,
-            "layer1_branch":    layer1,
-            "layer2_subbranch": layer2,
-            "branch_rf_key":    br_key,
-            "branch_rf_file":   rf_name,
-            "ml_label":         cand,
-            "knee_min_raw":     round(min_raw_knee, 1),
-            "layer2_reason":    layer2_reason,
-            "rf_proba":         round(rf_p, 4),
-            "rf_reject":        rf_rej,
-            "sts_phase":        self._sts_det.phase,
-            "sts_trigger_level": round(self._sts_det.trigger_level, 3),
-            "sts_confirm_level": round(self._sts_det.confirm_level, 3),
-            "ml_feature_mode":  "branch_adaptive_v2",
-        }
-        dbg.update(knee_gate_info)
-        dbg.update(sign)
-        if adaptive_dbg:
-            dbg["adaptive"] = adaptive_dbg
-        return {
-            "state":              state,
-            "step_event":         step_event,
-            "walk_dir":           walk_dir,
-            "counters":           dict(self._counters),
-            "sts_last_duration_s": self._sts_det.last_duration,
-            "debug": dbg,
-        }
-
-    # ── 内部辅助 ─────────────────────────────────────────────────────
-
-    def _resolve_walk_direction(self) -> str | None:
-        """返回当前有效的走向（'forward' / 'backward'），拿不到就 None。"""
-        d = self._dir_vote.result
-        if d in ("forward", "backward"):
-            return d
-        return self._last_valid_walk_dir
-
-    def _is_motion_state(self, s: str) -> bool:
-        return s in self._STEP_STATES
-
-    def _estimate_motion_amplitude(
-        self,
-        toe: float,
-        ff: float,
-        heel: float,
-        knee: float,
+        pff_l: float,
+        ph_l: float,
+        pff_r: float,
+        ph_r: float,
     ) -> float:
-        vals = [toe, ff, heel, knee]
-        inst = float(max(vals) - min(vals))
-        self._motion_amp_hist.append(inst)
-        if not self._motion_amp_hist:
-            return inst
-        return float(max(self._motion_amp_hist) - min(self._motion_amp_hist))
-
-    def _gait_signature_from_pressures(
-        self,
-        toe: float,
-        ff: float,
-        heel: float,
-        knee: float,
-    ) -> dict[str, object]:
-        total = max(toe + ff + heel, 1e-9)
-        heel_impact = heel / total
-        forefoot_dom = (toe + ff) / total
-        knee_activity = (
-            abs(knee - self._knee_baseline)
-            if self._knee_baseline is not None
-            else knee
+        inst = max(pff_l, ph_l, pff_r, ph_r) - min(pff_l, ph_l, pff_r, ph_r)
+        self._ff_heel_motion_hist.append(float(inst))
+        if not self._ff_heel_motion_hist:
+            return float(inst)
+        return float(
+            max(self._ff_heel_motion_hist) - min(self._ff_heel_motion_hist),
         )
 
-        initial, contact_order, release_order, complete = self._extract_gait_orders()
-
-        return {
-            "initial_contact_zone": initial,
-            "contact_order": contact_order,
-            "release_order": release_order,
-            "heel_impact_score": float(heel_impact),
-            "forefoot_dominance_score": float(forefoot_dom),
-            "knee_activity_level": float(knee_activity),
-            "gait_signature_complete": bool(complete),
-        }
-
-    def _update_zone_sequence(self, toe: float, ff: float, heel: float, t: float) -> None:
-        vals = {"toe": toe, "forefoot": ff, "heel": heel}
-        for zone, v in vals.items():
-            prev = self._zone_contact_state[zone]
+    def _update_zones_dominant(self, pff: float, ph: float, t: float) -> None:
+        for zone, v in (("forefoot", pff), ("heel", ph)):
+            prev = self._zone_state[zone]
             now = prev
             if prev:
                 if v <= FOOT_OFF_GROUND_TH:
@@ -1358,42 +993,319 @@ class OnlineRecognizer:
                 if v >= FOOT_ON_GROUND_TH:
                     now = True
             if now != prev:
-                self._zone_contact_state[zone] = now
+                self._zone_state[zone] = now
                 self._zone_event_hist.append(("on" if now else "off", zone, float(t)))
 
-    def _extract_order(self, kind: str) -> list[str]:
-        seq: list[str] = []
-        seen: set[str] = set()
-        for evt, zone, _t in reversed(self._zone_event_hist):
-            if evt != kind:
-                continue
-            if zone in seen:
-                continue
-            seq.append(zone)
-            seen.add(zone)
-            if len(seq) >= 3:
-                break
-        seq.reverse()
-        return seq
+    def update_bilateral(
+        self,
+        left: tuple[float, float, float],
+        right: tuple[float, float, float],
+        t: float | None = None,
+    ) -> dict:
+        """One bilateral frame: returns state, counters, debug."""
+        if t is None:
+            t = time.monotonic()
+        lf, lh, lk = (float(x) for x in left)
+        rf, rh, rk = (float(x) for x in right)
+        raw6 = np.array([lf, lh, lk, rf, rh, rk], dtype=np.float64)
+        raw6 = np.nan_to_num(raw6, nan=SENSOR_MAX, posinf=SENSOR_MAX, neginf=0.0)
+        raw6 = np.clip(raw6, 0.0, SENSOR_MAX)
+        raw6c = self._calibrate_raw6(raw6)
+        raw6c = np.asarray(raw6c, dtype=np.float64)
+        raw6c = np.nan_to_num(raw6c, nan=SENSOR_MAX, posinf=SENSOR_MAX, neginf=0.0)
+        raw6c = np.clip(raw6c, 0.0, SENSOR_MAX)
+        flat18, snaps = self._adapt_bank.update(raw6c)
+        self._p_hist.append(flat18)
 
-    def _extract_gait_orders(self) -> tuple[str, str, str, bool]:
-        contact = self._extract_order("on")
-        release = self._extract_order("off")
-        if len(contact) < 3 or len(release) < 3:
-            return "unknown", "unknown", "unknown", False
-        contact_order = "->".join(contact)
-        release_order = "->".join(release)
-        initial = contact[0]
-        complete = len(set(contact)) == 3 and len(set(release)) == 3
-        return initial, contact_order, release_order, complete
+        pff_l = self._f_lf.update(snaps[0].relative_pressure_ratio)
+        ph_l = self._f_lh.update(snaps[1].relative_pressure_ratio)
+        pkl = self._f_lk.update(snaps[2].relative_pressure_ratio)
+        pff_r = self._f_rf.update(snaps[3].relative_pressure_ratio)
+        ph_r = self._f_rh.update(snaps[4].relative_pressure_ratio)
+        pkr = self._f_rk.update(snaps[5].relative_pressure_ratio)
 
-    def _classify_standing_bilateral(
-        self, left_load: float, right_load: float,
-    ) -> str:
-        """根据左右脚承重分布判断：直立 / 偏左 / 偏右。"""
-        lr_ratio = (left_load - right_load) / (left_load + right_load + 1e-9)
-        if abs(lr_ratio) < LEAN_LR_TH:
-            return "STANDING_UPRIGHT"
-        if lr_ratio > LEAN_LR_TH:
-            return "STANDING_LEFT_LEAN"
-        return "STANDING_RIGHT_LEAN"
+        left_load = pff_l + ph_l
+        right_load = pff_r + ph_r
+        p_sum = left_load + right_load
+        p_knee_avg = 0.5 * (pkl + pkr)
+        lr_ratio = (left_load - right_load) / (p_sum + 1e-9)
+
+        if self._knee_baseline is None:
+            self._knee_init_buf.append(p_knee_avg)
+            if len(self._knee_init_buf) >= 30:
+                self._knee_baseline = float(np.mean(self._knee_init_buf))
+
+        n_hist = len(self._p_hist)
+        if n_hist < 1:
+            w63 = np.zeros((ML_WINDOW_SIZE, 6, 3), dtype=np.float64)
+        else:
+            take = min(n_hist, ML_WINDOW_SIZE)
+            win2 = np.array(list(self._p_hist)[-take:])
+            if win2.shape[0] < ML_WINDOW_SIZE:
+                pad = np.tile(win2[0:1], (ML_WINDOW_SIZE - win2.shape[0], 1))
+                win2 = np.vstack([pad, win2])
+            w63 = win2.reshape(ML_WINDOW_SIZE, 6, 3)
+
+        knee_mode, knee_soft = self._knee_router.update(w63, t)
+        knee_ext = max(pkl, pkr) >= WALK_KNEE_RATIO_EXTEND_TH
+        dom_left = left_load >= right_load
+        dff = pff_l if dom_left else pff_r
+        dheel = ph_l if dom_left else ph_r
+        self._update_zones_dominant(dff, dheel, t)
+
+        step_l = self._contact_l.update(left_load, t)
+        step_r = self._contact_r.update(right_load, t)
+        cstep = step_l or step_r
+        st_src: str | None = "left" if step_l else ("right" if step_r else None)
+        sl = self._heel_step_l.update(ph_l)
+        sr = self._heel_step_r.update(ph_r)
+        hstep = self._step_det_l.update(sl) or self._step_det_r.update(sr)
+        raw_step = bool(cstep)
+        if not raw_step and hstep:
+            raw_step = True
+            st_src = st_src or "heel_fb"
+
+        if raw_step:
+            self._last_step_t = t
+
+        recent = (t - self._last_step_t) < WALK_TIMEOUT_S
+        amp = self._ff_heel_only_amplitude(pff_l, ph_l, pff_r, ph_r)
+        knee_low = knee_mode == "KNEE_LOW_ACTIVITY"
+        if knee_low:
+            l2, l2r = self._layer2.update(
+                bool(raw_step), recent, amp, t,
+                knee_low_activity=True, knee_extended_now=knee_ext,
+            )
+        elif knee_mode == "KNEE_STATIC_BENT":
+            l2, l2r = "STATIC_BRANCH", "knee_static_bent"
+        else:
+            l2, l2r = "MOTION_BRANCH", "knee_dynamic_active"
+        brk = self._branch_key(knee_mode, l2)
+        static_brk = "sitting" if knee_mode == "KNEE_STATIC_BENT" else "standing"
+        fallback_reason = "not_available"
+        if len(self._p_hist) < ML_WINDOW_SIZE:
+            feat = None
+            g8 = eight_named_gait_features(w63)
+            cand, rfp, rfrj, rfn = "UNKNOWN", 0.0, "window_not_ready", ""
+            scand, s_rfp = "UNKNOWN", 0.0
+            fallback_reason = "window_not_ready"
+            rf_dynamic_th = None
+        else:
+            feat, g8 = build_full_feature_vector_and_g8_from_window(w63)
+            if feat is None:
+                g8 = eight_named_gait_features(w63)
+                cand, rfp, rfrj, rfn = "UNKNOWN", 0.0, "feature_error", ""
+                scand, s_rfp = "UNKNOWN", 0.0
+                fallback_reason = "feature_error"
+                rf_dynamic_th = None
+            else:
+                cand, rfp, rfrj, rfn = self._rf_predict_from_feat(brk, feat)
+                rf_dynamic_th = None
+                if isinstance(rfrj, str) and "thr=" in rfrj:
+                    try:
+                        rf_dynamic_th = float(rfrj.split("thr=", 1)[1].rstrip(")"))
+                    except Exception:
+                        rf_dynamic_th = None
+                if static_brk == brk:
+                    scand, s_rfp = cand, rfp
+                else:
+                    scand, s_rfp, _, _ = self._rf_predict_from_feat(static_brk, feat)
+                fallback_used = False
+                fallback_reason = "none"
+                if (
+                    static_brk != brk
+                    and cand == "UNKNOWN"
+                    and isinstance(rfrj, str)
+                    and rfrj.startswith("low_proba")
+                    and scand != "UNKNOWN"
+                ):
+                    base_th = branch_base_proba_threshold(static_brk)
+                    if float(s_rfp) >= max(0.20, base_th - FALLBACK_BRANCH_MARGIN):
+                        cand = scand
+                        rfp = float(s_rfp)
+                        rfrj = f"fallback_from_{brk}"
+                        fallback_used = True
+                        fallback_reason = f"static_branch:{static_brk}"
+                if not fallback_used:
+                    fallback_reason = "not_triggered"
+                if (
+                    brk == "stairs"
+                    and self._sm.state in STAIRS_LABELS
+                    and cand in STAIRS_LABELS
+                    and cand != self._sm.state
+                ):
+                    if float(rfp) < STAIRS_FLIP_MIN_PROBA:
+                        cand = self._sm.state
+                        rfrj = f"stairs_flip_hold(p<{STAIRS_FLIP_MIN_PROBA:.2f})"
+                        fallback_reason = "stairs_flip_hold_low_proba"
+                        self._stairs_flip_pending = None
+                        self._stairs_flip_pending_cnt = 0
+                    else:
+                        if self._stairs_flip_pending == cand:
+                            self._stairs_flip_pending_cnt += 1
+                        else:
+                            self._stairs_flip_pending = cand
+                            self._stairs_flip_pending_cnt = 1
+                        if self._stairs_flip_pending_cnt < STAIRS_FLIP_CONFIRM_FRAMES:
+                            cand = self._sm.state
+                            rfrj = (
+                                "stairs_flip_pending("
+                                f"{self._stairs_flip_pending_cnt}/{STAIRS_FLIP_CONFIRM_FRAMES})"
+                            )
+                            fallback_reason = "stairs_flip_pending_confirm"
+                        else:
+                            fallback_reason = "stairs_flip_confirmed"
+                            self._stairs_flip_pending = None
+                            self._stairs_flip_pending_cnt = 0
+                else:
+                    self._stairs_flip_pending = None
+                    self._stairs_flip_pending_cnt = 0
+        sensor_var = _sensor_variation_from_w63(w63)
+        motion_activity = float(
+            0.5 * sensor_var + 0.5 * min(1.0, max(0.0, amp * 2.0)),
+        )
+        motion_evidence = bool(
+            raw_step
+            or (recent and amp >= MOTION_ENTER_AMP_TH)
+            or knee_mode == "KNEE_DYNAMIC_ACTIVE"
+        )
+        stop_candidate = bool(
+            (not recent)
+            and amp <= MOTION_STOP_AMP_TH
+            and sensor_var <= MOTION_STOP_VAR_TH
+        )
+        use_dir_vote = bool(
+            raw_step
+            and brk == "walking"
+            and l2 == "MOTION_BRANCH"
+        )
+        if use_dir_vote:
+            self._walk_dir.on_step(t, g8, use_vote=True)
+
+        fsts, psts = self._sts_det.update(
+            p_sum, p_knee_avg, self._sm.state, self._knee_baseline, t,
+        )
+        stabilized_state, mode_dbg = self._mode_stabil.update(
+            t,
+            amp,
+            sensor_var,
+            motion_evidence,
+            stop_candidate,
+            scand,
+            cand,
+            fsts=fsts,
+            psts=psts,
+            motion_activity_score=motion_activity,
+        )
+        prev_state = self._sm.state
+        state = self._sm.propose(
+            stabilized_state,
+            t,
+            immediate=bool(fsts or psts),
+        )
+        gate_blocked = (stabilized_state != prev_state) and (state == prev_state)
+        gate_passed = (stabilized_state != prev_state) and (state == stabilized_state)
+        if gate_blocked:
+            self._state_gate_blocked_total += 1
+        if gate_passed:
+            self._state_gate_pass_total += 1
+        wdir = self._walk_dir.to_walk_dir()
+        if wdir in ("forward", "backward"):
+            self._last_valid_walk_dir = wdir
+
+        locked = self._walk_dir.locked
+        step_ev = bool(raw_step and state in self._STEP_STATES)
+        step_assigned_to = "—"
+        step_assign_reason = "no_step_event"
+        if step_ev:
+            self._counters["total_steps"] += 1
+            if state == "STAIRS_UP":
+                self._counters["up_steps"] += 1
+                step_assigned_to = "up_steps"
+                step_assign_reason = "stair_state"
+            elif state == "STAIRS_DOWN":
+                self._counters["down_steps"] += 1
+                step_assigned_to = "down_steps"
+                step_assign_reason = "stair_state"
+            elif state in ("WALKING_FORWARD", "WALKING_BACKWARD"):
+                if locked == "FORWARD":
+                    self._counters["forward_steps"] += 1
+                    step_assigned_to = "forward_steps"
+                    step_assign_reason = "locked_forward"
+                elif locked == "BACKWARD":
+                    self._counters["backward_steps"] += 1
+                    step_assigned_to = "backward_steps"
+                    step_assign_reason = "locked_backward"
+                else:
+                    step_assigned_to = "none"
+                    step_assign_reason = "dir_unknown_skip_fb"
+            else:
+                step_assigned_to = "none"
+                step_assign_reason = "unexpected_step_state"
+
+        dbg: dict = {
+            "p_ff_l": round(pff_l, 3), "p_heel_l": round(ph_l, 3), "p_knee_l": round(pkl, 3),
+            "p_ff_r": round(pff_r, 3), "p_heel_r": round(ph_r, 3), "p_knee_r": round(pkr, 3),
+            "p_sum": round(p_sum, 3), "ff_heel_motion_amp": round(amp, 4),
+            "left_load": round(left_load, 3), "right_load": round(right_load, 3),
+            "branch": knee_mode,
+            "knee_mode": knee_mode,
+            "knee_mode_soft": knee_soft,
+            "layer2_subbranch": l2, "layer2_reason": l2r,
+            "layer2_motion_amp_th": round(self._layer2.current_motion_amp_threshold, 4),
+            "motion_flag": l2 == "MOTION_BRANCH",
+            "branch_rf_key": brk, "ml_label": cand, "ml_label_static_branch": scand,
+            "rf_proba": round(rfp, 4), "static_rf_proba": round(s_rfp, 4),
+            "rf_reject": rfrj, "rf_model_name": os.path.basename(rfn) if rfn else "—",
+            "rf_fallback_reason": fallback_reason,
+            "stairs_flip_pending": self._stairs_flip_pending or "—",
+            "stairs_flip_pending_cnt": int(self._stairs_flip_pending_cnt),
+            "rf_dynamic_threshold": (round(float(rf_dynamic_th), 4) if rf_dynamic_th is not None else "—"),
+            "heel_peak_time": g8["heel_peak_time"],
+            "forefoot_peak_time": g8["forefoot_peak_time"],
+            "heel_first_score": g8["heel_first_score"],
+            "forefoot_first_score": g8["forefoot_first_score"],
+            "contact_order_confidence": round(g8["contact_order_confidence"], 4),
+            "walk_dir_vote_forward": self._walk_dir.vote_forward,
+            "walk_dir_vote_backward": self._walk_dir.vote_backward,
+            "walk_dir_locked": locked,
+            "walk_dir_confidence": round(self._walk_dir.path_confidence, 4),
+            "walk_dir_switch_pending": self._walk_dir.switch_pending,
+            "step_assigned_to": step_assigned_to,
+            "step_assign_reason": step_assign_reason,
+            "state_gate_prev": prev_state,
+            "state_gate_candidate": stabilized_state,
+            "state_gate_immediate": bool(fsts or psts),
+            "state_gate_min_duration_s": float(STATE_MIN_DURATION_S),
+            "state_gate_blocked_now": bool(gate_blocked),
+            "state_gate_passed_now": bool(gate_passed),
+            "state_gate_blocked_total": int(self._state_gate_blocked_total),
+            "state_gate_pass_total": int(self._state_gate_pass_total),
+        }
+        dbg.update(mode_dbg)
+        dbg["adaptive"] = {n: _snapshot_to_adaptive_debug_dict(s) for n, s in zip(CHANNEL_NAMES_DUAL, snaps)}
+
+        return {
+            "state": state,
+            "step_event": step_ev,
+            "walk_dir": wdir,
+            "counters": dict(self._counters),
+            "sts_last_duration_s": self._sts_det.last_duration,
+            "debug": dbg,
+        }
+
+    def update_single(
+        self,
+        fore: float,
+        heel: float,
+        knee: float,
+        t: float | None = None,
+    ) -> dict:
+        """One foot only: other side padded to 4095 (unloaded)."""
+        if t is None:
+            t = time.monotonic()
+        return self.update_bilateral(
+            (fore, heel, knee),
+            (_PAD_UNLOADED, _PAD_UNLOADED, _PAD_UNLOADED),
+            t=t,
+        )

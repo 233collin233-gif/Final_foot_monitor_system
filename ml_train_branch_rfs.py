@@ -1,30 +1,5 @@
 #!/usr/bin/env python3
-"""
-Train four branch RandomForest models (bucketed hierarchical labels).
-
-Buckets (by ground-truth ``Label`` in CSV, after canonicalisation):
-  - active_motion:   STAIRS_UP, STAIRS_DOWN
-  - active_static:   SITTING_NORMAL, SITTING_CROSSLEGGED
-  - inactive_motion: WALKING_FORWARD, WALKING_BACKWARD
-  - inactive_static: STANDING_UPRIGHT, STANDING_LEFT_LEAN, STANDING_RIGHT_LEAN
-
-Features match runtime: ``extract_features_dual_adaptive`` + ``auxiliary_from_window_ratios``
-(last frame ratios in the window) — same ``AUX_DIM`` as ``ml_branch_models.build_auxiliary_vector``
-layout (training fills kinematic part from window proxy; stance slots from last frame loads).
-
-Usage (from project root)::
-
-    # 1) auto-derive a personal calibration from labelled CSVs and train with it
-    python ml_train_branch_rfs.py
-
-    # 2) reuse an existing JSON (typically produced by the UI online wizard)
-    python ml_train_branch_rfs.py --calib personal_calibration.json
-
-    # 3) skip personal calibration entirely (legacy / ablation)
-    python ml_train_branch_rfs.py --no-calib
-
-Requires ``saving_data/sensor_data_dual_labeled_*.csv`` with raw ADC columns.
-"""
+"""Train four per-branch RFs from labeled saving_data CSVs, blocked/LOFO eval, write joblib."""
 
 from __future__ import annotations
 
@@ -33,7 +8,6 @@ import os
 import sys
 
 import csv
-import glob
 
 import numpy as np
 from sklearn.ensemble import RandomForestClassifier
@@ -45,56 +19,84 @@ from sklearn.model_selection import (
     cross_val_score,
     train_test_split,
 )
+from sklearn.calibration import CalibratedClassifierCV
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
 from ml_activity_features import (
+    DATA_DIR,
     WINDOW_SIZE,
     WINDOW_STEP,
+    labeled_csv_paths,
     load_csv_files,
     simulate_adaptive_sequence_dual,
 )
 from ml_branch_models import (
     AUX_DIM,
     BRANCH_TO_FILE,
-    RF_ACTIVE_MOTION,
-    RF_ACTIVE_STATIC,
-    RF_INACTIVE_MOTION,
-    RF_INACTIVE_STATIC,
-    build_full_feature_vector,
-    auxiliary_from_window_ratios,
+    apply_branch_decision_bias,
+    build_full_feature_vector_from_window,
 )
 
-# TODO_PARAM
-DATA_DIR = "saving_data"
 RANDOM_STATE = 42
-RF_N_ESTIMATORS = 200
-RF_MAX_DEPTH = 22
+RF_N_ESTIMATORS = 280
+RF_MAX_DEPTH = 24
+RF_MIN_SAMPLES_LEAF = 2
+RF_MAX_FEATURES = "sqrt"
+RF_MAX_SAMPLES = 0.88
+CALIBRATION_ENABLED = True
+CALIBRATION_METHOD = "sigmoid"
+CALIBRATION_MIN_CLASS_SAMPLES = 12
 
-# Three-way split (no extra dataset available → carve it out of the 33 CSVs).
-# 60 / 20 / 20 is the default: train / validation / test.
 TEST_FRAC = 0.20
-VAL_FRAC_OF_REMAINING = 0.25         # 0.25 of 0.80 = 0.20 of the whole
-CV_N_SPLITS = 5                      # Stratified K-Fold on the train portion
-
-# Blocked CV parameters (default evaluation).
+VAL_FRAC_OF_REMAINING = 0.25
+CV_N_SPLITS = 5
 BLOCKED_N_FOLDS = 5
-# Purge = number of adjacent windows to drop from TRAIN on each side of each
-# TEST block, so the two sets do not share frames via the sliding-window overlap.
-# WINDOW_SIZE=10 and WINDOW_STEP=2 → 5 windows of overlap span.
 BLOCKED_PURGE = 5
+
+RF_BASE_CONFIG: dict[str, object] = {
+    "n_estimators": RF_N_ESTIMATORS,
+    "max_depth": RF_MAX_DEPTH,
+    "min_samples_leaf": RF_MIN_SAMPLES_LEAF,
+    "max_features": RF_MAX_FEATURES,
+    "max_samples": RF_MAX_SAMPLES,
+    "class_weight": "balanced_subsample",
+}
+
+BRANCH_RF_CANDIDATES: dict[str, list[dict[str, object]]] = {
+    "sitting": [
+        {},
+        {"n_estimators": 360, "max_depth": 20, "min_samples_leaf": 1, "max_samples": 0.95},
+    ],
+    "standing": [
+        {},
+        {"n_estimators": 320, "max_depth": 18, "min_samples_leaf": 1, "max_samples": 0.95},
+    ],
+    "walking": [
+        {},
+        {"n_estimators": 420, "max_depth": 20, "min_samples_leaf": 1, "max_samples": 0.95},
+        {"n_estimators": 500, "max_depth": 14, "min_samples_leaf": 2, "class_weight": "balanced"},
+        {"n_estimators": 360, "max_depth": 12, "min_samples_leaf": 3, "max_features": None},
+    ],
+    "stairs": [
+        {},
+        {"n_estimators": 420, "max_depth": 16, "min_samples_leaf": 1, "max_samples": 0.95},
+        {"n_estimators": 520, "max_depth": 10, "min_samples_leaf": 2, "class_weight": "balanced"},
+        {"n_estimators": 360, "max_depth": None, "min_samples_leaf": 1, "max_features": None},
+    ],
+}
 
 
 LABEL_TO_BRANCH: dict[str, str] = {
-    "STAIRS_UP": "active_motion",
-    "STAIRS_DOWN": "active_motion",
-    "SITTING_NORMAL": "active_static",
-    "SITTING_CROSSLEGGED": "active_static",
-    "WALKING_FORWARD": "inactive_motion",
-    "WALKING_BACKWARD": "inactive_motion",
-    "STANDING_UPRIGHT": "inactive_static",
-    "STANDING_LEFT_LEAN": "inactive_static",
-    "STANDING_RIGHT_LEAN": "inactive_static",
+    "SITTING_NORMAL": "sitting",
+    "SITTING_CROSSLEGGED": "sitting",
+    "STAIRS_UP": "stairs",
+    "STAIRS_DOWN": "stairs",
+    "WALKING_FORWARD": "walking",
+    "WALKING_BACKWARD": "walking",
+    "STANDING_UPRIGHT": "standing",
+    "STANDING_LEFT_LEAN": "standing",
+    "STANDING_RIGHT_LEAN": "standing",
 }
 
 
@@ -112,18 +114,10 @@ def _canonical_label(s: str) -> str:
 def _load_csv_per_file(
     data_dir: str = DATA_DIR,
 ) -> "list[tuple[str, np.ndarray, list[str]]]":
-    """Iterate labelled CSVs **one by one**, preserving each file's temporal order.
-
-    Returns ``[(filepath, raw_t8, labels), ...]`` where ``raw_t8`` is ``(T_i, 8)``
-    ADC counts and ``labels`` is the aligned list of ground-truth labels.
-    Uses the same column-resolution logic as :func:`ml_activity_features.load_csv_files`
-    but never concatenates files — time continuity within each CSV is preserved.
-    """
-    # Import lazily to avoid a cycle at module import time.
+    """One (path, (T,6), labels) per file."""
     from ml_activity_features import _find_col  # type: ignore
 
-    pattern = os.path.join(data_dir, "sensor_data_dual_labeled_*.csv")
-    files = sorted(glob.glob(pattern))
+    files = labeled_csv_paths(data_dir)
     out: list[tuple[str, np.ndarray, list[str]]] = []
     for path in files:
         rows: list[list[float]] = []
@@ -133,21 +127,32 @@ def _load_csv_per_file(
             if reader.fieldnames is None:
                 continue
             fields = [x.strip() for x in reader.fieldnames]
-            cols = [
-                _find_col(fields, n)
-                for n in (
-                    "L_Toe", "L_Forefoot", "L_Heel", "L_Knee",
-                    "R_Toe", "R_Forefoot", "R_Heel", "R_Knee",
-                )
-            ]
-            if not all(cols):
+            names_6 = (
+                "L_Forefoot", "L_Heel", "L_Knee",
+                "R_Forefoot", "R_Heel", "R_Knee",
+            )
+            cols6 = [_find_col(fields, n) for n in names_6]
+            if not all(cols6):
                 continue
+            c_l_toe = _find_col(fields, "L_Toe")
+            c_r_toe = _find_col(fields, "R_Toe")
+            use_8 = bool(c_l_toe and c_r_toe)
             label_col = _find_col(fields, "Label")
             for row in reader:
                 try:
-                    rows.append([float(row[c]) for c in cols])  # type: ignore[index]
+                    if use_8:
+                        v8 = [
+                            float(row[c_l_toe]), float(row[cols6[0]]),
+                            float(row[cols6[1]]), float(row[cols6[2]]),
+                            float(row[c_r_toe]), float(row[cols6[3]]),
+                            float(row[cols6[4]]), float(row[cols6[5]]),
+                        ]
+                        rowf = v8[1:4] + v8[5:8]
+                    else:
+                        rowf = [float(row[c]) for c in cols6]  # type: ignore[index]
                 except (ValueError, KeyError):
                     continue
+                rows.append(rowf)
                 labs.append(row.get(label_col, "") if label_col else "")
         if rows:
             out.append((path, np.asarray(rows, dtype=np.float64), labs))
@@ -158,19 +163,7 @@ def _windows_for_branch_per_file(
     per_file: "list[tuple[str, np.ndarray, list[str]]]",
     calibration: "object | None" = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Build (X, y, branch, file_idx, segment_id) for each window.
-
-    Each window is also tagged with a **segment id** — a sequential integer
-    that only stays the same while the previous and current window share
-    ``(file_idx, majority_label)``. A segment is therefore a *maximal
-    contiguous run of same-label windows inside one CSV*. Later the blocked
-    CV carves each segment into K contiguous chunks so every fold's test set
-    covers every class.
-
-    Because ``simulate_adaptive_sequence_dual`` is deterministic per-frame
-    when fed a calibration with global stats (the bank is frozen), processing
-    files independently yields bit-identical features to the concat path.
-    """
+    """Build windows; segment_ids group contiguous same-(file,label) runs for CV."""
     X_rows: list[np.ndarray] = []
     y_rows: list[str] = []
     b_rows: list[str] = []
@@ -180,16 +173,14 @@ def _windows_for_branch_per_file(
     segment_counter = -1
     prev_key: "tuple[int, str] | None" = None
 
-    for fidx, (_path, raw_t8, labels) in enumerate(per_file):
-        seq = simulate_adaptive_sequence_dual(raw_t8, calibration=calibration)
+    for fidx, (_path, raw_t6, labels) in enumerate(per_file):
+        seq = simulate_adaptive_sequence_dual(raw_t6, calibration=calibration)
         T = seq.shape[0]
-        # A new file always starts a fresh segment-counter context.
         prev_key = None
         for i in range(0, T - WINDOW_SIZE + 1, WINDOW_STEP):
             lbl_w = [_canonical_label(labels[i + j]) for j in range(WINDOW_SIZE)]
             majority = max(set(lbl_w), key=lbl_w.count)
             if lbl_w.count(majority) / len(lbl_w) < 0.8:
-                # Mixed window → break segment continuity.
                 prev_key = None
                 continue
             if majority not in LABEL_TO_BRANCH:
@@ -197,10 +188,7 @@ def _windows_for_branch_per_file(
                 continue
             br = LABEL_TO_BRANCH[majority]
             win = seq[i : i + WINDOW_SIZE]
-            ratios_last = win[-1, :, 1].astype(np.float64)
-            aux = auxiliary_from_window_ratios(ratios_last)
-            flat = win.reshape(WINDOW_SIZE, 24)
-            feat = build_full_feature_vector(flat, aux)
+            feat = build_full_feature_vector_from_window(win)
             if feat is None:
                 prev_key = None
                 continue
@@ -226,29 +214,11 @@ def _windows_for_branch_per_file(
     )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  Blocked intra-file CV (default evaluation)
-# ─────────────────────────────────────────────────────────────────────────────
 def _assign_blocked_folds(
     segment_ids: np.ndarray,
     n_folds: int = BLOCKED_N_FOLDS,
 ) -> np.ndarray:
-    """Assign fold IDs (0..n_folds-1) to every window via contiguous chunks
-    *within each label-segment*.
-
-    A label-segment is a maximal contiguous run of windows sharing the same
-    ``(file_idx, majority_label)`` (see ``_windows_for_branch_per_file``).
-    Splitting each segment into ``n_folds`` contiguous pieces and using the
-    k-th piece of every segment as fold k's test set guarantees:
-
-      * Every fold's test set contains samples from every label that exists in
-        the dataset (as long as that label occurs in at least one segment).
-      * Every test block is contiguous in time, so local temporal order is
-        preserved inside the block.
-      * Very short segments (< n_folds windows) fall back to round-robin
-        assignment; their contribution is small enough that this doesn't break
-        the invariant in practice.
-    """
+    """Assign fold id per window from segment chunks."""
     folds = np.full(len(segment_ids), -1, dtype=np.int64)
     for seg in np.unique(segment_ids):
         idx = np.where(segment_ids == seg)[0]
@@ -267,15 +237,7 @@ def _assign_blocked_folds(
 
 
 class BlockedIntraFileCV:
-    """A pre-computed, purged CV iterator compatible with sklearn.
-
-    ``fold_ids[i]`` = the fold the i-th window belongs to. For each fold k:
-
-      * test = windows with ``fold_ids == k``
-      * train = windows with ``fold_ids != k`` **minus** any window within
-        ``purge`` positions (array order) of a test window → prevents the
-        sliding-window overlap at chunk boundaries from leaking information.
-    """
+    """CV splitter: train/test from fold_ids, optional purge of boundary windows."""
 
     def __init__(
         self,
@@ -292,18 +254,11 @@ class BlockedIntraFileCV:
         for k in range(self.n_splits):
             test_mask = self.fold_ids == k
             if not test_mask.any():
-                # Degenerate fold — yield empty test, full train; sklearn will
-                # handle or skip it. In practice this only happens when every
-                # segment was shorter than n_splits, which we guard against.
                 yield np.where(~test_mask)[0], np.where(test_mask)[0]
                 continue
-            # Purge zone: exclude from TRAIN any window within `purge` positions
-            # of any TEST window (in array order within this branch).
             test_idx = np.where(test_mask)[0]
             train_mask = ~test_mask
             if self.purge > 0:
-                # Vectorised purge: widen the test mask by ±purge, subtract
-                # from train.
                 widened = np.zeros(n, dtype=bool)
                 for offset in range(-self.purge, self.purge + 1):
                     if offset == 0:
@@ -322,17 +277,12 @@ class BlockedIntraFileCV:
 
 
 def _windows_for_branch(
-    raw_t8: np.ndarray,
+    raw_t6: np.ndarray,
     labels: list[str],
     calibration: "object | None" = None,
 ) -> tuple[np.ndarray, np.ndarray, list[str]]:
-    """Returns X (n, feat_dim), y labels, branch list for each row.
-
-    Passing ``calibration`` (a :class:`personal_calibration.PersonalCalibration`)
-    routes the raw stream through personal ``[min, max]`` normalization
-    before the EWMA bank; the feature dimensionality is unchanged.
-    """
-    seq = simulate_adaptive_sequence_dual(raw_t8, calibration=calibration)
+    """One file's windows: features, label, branch key."""
+    seq = simulate_adaptive_sequence_dual(raw_t6, calibration=calibration)
     T = seq.shape[0]
     X_rows: list[np.ndarray] = []
     y_rows: list[str] = []
@@ -346,10 +296,7 @@ def _windows_for_branch(
             continue
         br = LABEL_TO_BRANCH[majority]
         win = seq[i : i + WINDOW_SIZE]
-        ratios_last = win[-1, :, 1].astype(np.float64)
-        aux = auxiliary_from_window_ratios(ratios_last)
-        flat = win.reshape(WINDOW_SIZE, 24)
-        feat = build_full_feature_vector(flat, aux)
+        feat = build_full_feature_vector_from_window(win)
         if feat is None:
             continue
         X_rows.append(feat)
@@ -366,7 +313,7 @@ def _format_confusion_matrix(
     *,
     header: str,
 ) -> str:
-    """ASCII confusion matrix. Rows = true label, columns = predicted label."""
+    """Pretty-print cm with recall/precision."""
     w = max(10, max(len(c) for c in classes) + 2)
     lines = [f"  {header}", f"  {'(rows=true, cols=pred)'.ljust(4 + w)}"]
     head = " " * (w + 4) + " ".join(c.rjust(w) for c in classes)
@@ -376,7 +323,6 @@ def _format_confusion_matrix(
         cells = [f"{int(cm[i, j]):>{w}d}" for j in range(len(classes))]
         suffix = f"  | n={int(row_sum)}"
         lines.append(f"  {true_cls.ljust(w)} | " + " ".join(cells) + suffix)
-    # per-class recall / precision
     col_sums = cm.sum(axis=0)
     row_sums = cm.sum(axis=1)
     diag = np.diag(cm)
@@ -397,7 +343,7 @@ def _save_confusion_png(
     *,
     title: str,
 ) -> None:
-    """Save a labelled confusion-matrix heatmap. Silently skip if matplotlib missing."""
+    """Save confusion matrix PNG; no-op if matplotlib missing."""
     try:
         import matplotlib
         matplotlib.use("Agg")
@@ -412,7 +358,6 @@ def _save_confusion_png(
     ax.set_yticklabels(classes, fontsize=9)
     ax.set_xlabel("Predicted"); ax.set_ylabel("True")
     ax.set_title(title, fontsize=10)
-    # annotate counts
     row_sums = cm.sum(axis=1, keepdims=True)
     row_sums = np.maximum(row_sums, 1)
     for i in range(cm.shape[0]):
@@ -427,22 +372,89 @@ def _save_confusion_png(
     plt.close(fig)
 
 
-def _build_pipeline() -> Pipeline:
+def _build_pipeline(rf_overrides: "dict[str, object] | None" = None) -> Pipeline:
+    cfg = dict(RF_BASE_CONFIG)
+    if rf_overrides:
+        cfg.update(rf_overrides)
     return Pipeline(
         [
             ("scaler", StandardScaler()),
             (
                 "rf",
                 RandomForestClassifier(
-                    n_estimators=RF_N_ESTIMATORS,
-                    max_depth=RF_MAX_DEPTH,
+                    n_estimators=int(cfg["n_estimators"]),
+                    max_depth=cfg["max_depth"],
+                    min_samples_leaf=int(cfg["min_samples_leaf"]),
+                    max_features=cfg["max_features"],
+                    max_samples=cfg["max_samples"],
                     random_state=RANDOM_STATE,
-                    class_weight="balanced_subsample",
+                    class_weight=cfg["class_weight"],
                     n_jobs=-1,
                 ),
             ),
         ]
     )
+
+
+def _branch_candidate_overrides(branch: str) -> "list[dict[str, object]]":
+    return BRANCH_RF_CANDIDATES.get(branch, [{}])
+
+
+def _blocked_candidate_search(
+    branch: str,
+    X: np.ndarray,
+    y: np.ndarray,
+    fold_ids: np.ndarray,
+    classes_ordered: "list[str]",
+) -> "tuple[dict[str, object], dict[str, object]]":
+    """Grid-search RF override dicts; maximize min per-class recall then OOF acc."""
+    candidates = _branch_candidate_overrides(branch)
+    cv = BlockedIntraFileCV(fold_ids, BLOCKED_N_FOLDS, purge=BLOCKED_PURGE)
+    best_override: dict[str, object] = {}
+    best_report: dict[str, object] = {
+        "blocked_oof_accuracy": float("-inf"),
+        "blocked_min_class_recall": float("-inf"),
+        "candidate_index": -1,
+    }
+    for i, override in enumerate(candidates):
+        pipe = _build_pipeline(override)
+        oof_pred = cross_val_predict(pipe, X, y, cv=cv, n_jobs=-1)
+        acc = float(accuracy_score(y, oof_pred))
+        cm = confusion_matrix(y, oof_pred, labels=classes_ordered)
+        recalls = np.divide(
+            np.diag(cm).astype(np.float64),
+            np.maximum(cm.sum(axis=1), 1),
+            dtype=np.float64,
+        )
+        min_recall = float(np.min(recalls)) if recalls.size else 0.0
+        cand_key = (min_recall, acc, -i)
+        best_key = (
+            float(best_report["blocked_min_class_recall"]),
+            float(best_report["blocked_oof_accuracy"]),
+            -int(best_report["candidate_index"]),
+        )
+        if cand_key > best_key:
+            best_override = dict(override)
+            best_report = {
+                "blocked_oof_accuracy": acc,
+                "blocked_min_class_recall": min_recall,
+                "candidate_index": int(i),
+            }
+    return best_override, best_report
+
+
+def _labels_from_proba_with_branch_bias(
+    branch: str,
+    classes_ordered: "list[str]",
+    proba: np.ndarray,
+) -> np.ndarray:
+    cls = [str(c) for c in classes_ordered]
+    out: list[str] = []
+    for row in np.asarray(proba, dtype=np.float64):
+        adj = apply_branch_decision_bias(branch, cls, row)
+        ji = int(np.argmax(adj))
+        out.append(cls[ji])
+    return np.asarray(out, dtype=object)
 
 
 def _train_one_branch(
@@ -455,32 +467,9 @@ def _train_one_branch(
     save_plots_dir: str | None = None,
     groups: np.ndarray | None = None,
     segment_ids: np.ndarray | None = None,
-    eval_mode: str = "blocked",
+    eval_mode: str = "blocked_lofo",
 ) -> dict:
-    """Train one branch RF.
-
-    Evaluation strategies:
-
-    * ``eval_mode="blocked"`` (default, recommended for time-series)
-      Per-segment contiguous-block CV. Each **label-segment** (a maximal run
-      of same-label windows inside one CSV) is sliced into ``BLOCKED_N_FOLDS``
-      contiguous chunks; fold k tests on the k-th chunk of every segment. So
-      every fold's test set covers every class present in the dataset, each
-      test chunk is a contiguous run of frames (local time order preserved),
-      and a purge gap is applied so train/test don't share frames via the
-      sliding-window overlap.
-
-    * ``eval_mode="lofo"``
-      Leave-One-File-Out. Each fold holds out one whole CSV. Strictest in
-      terms of subject/session independence, but many files contain only a
-      subset of labels, which inflates std and underestimates per-class recall.
-
-    * ``eval_mode="random"``
-      60 / 20 / 20 stratified shuffle split — fast but leaks neighbour frames
-      across train/val/test. Kept for ablation.
-
-    The **deployed model is always fitted on every window** after evaluation.
-    """
+    """Fit one branch: blocked and/or LOFO and/or random split per eval_mode."""
     print(f"\n=== Branch: {name} ===")
     metrics: dict = {"branch": name, "n_samples": int(X.shape[0])}
 
@@ -493,42 +482,56 @@ def _train_one_branch(
     print("  class counts:", class_counts)
     metrics["class_counts"] = class_counts
 
-    pipe = _build_pipeline()
-    classes_ordered = sorted(set(y))   # for consistent confusion-matrix axes
+    classes_ordered = sorted(set(y))
+    selected_rf_overrides: dict[str, object] = {}
+    pipe = _build_pipeline(selected_rf_overrides)
 
+    run_blocked = eval_mode in ("blocked", "blocked_lofo")
+    run_lofo = eval_mode in ("lofo", "blocked_lofo")
     use_blocked = (
-        eval_mode == "blocked"
+        run_blocked
         and segment_ids is not None
         and len(segment_ids) == len(y)
     )
     use_lofo = (
-        not use_blocked
-        and eval_mode == "lofo"
+        run_lofo
         and groups is not None
         and len(np.unique(groups)) >= 3
         and len(groups) == len(y)
     )
 
     if use_blocked:
-        # ── Blocked intra-file CV ───────────────────────────────────────────
         fold_ids = _assign_blocked_folds(segment_ids, n_folds=BLOCKED_N_FOLDS)
         n_segments = int(len(np.unique(segment_ids)))
         print(f"  [BLOCKED-CV] n_segments={n_segments}  "
               f"n_folds={BLOCKED_N_FOLDS}  purge={BLOCKED_PURGE} windows")
 
-        # Sanity check: is every label represented in every fold's test set?
         for k in range(BLOCKED_N_FOLDS):
             test_lbls = set(y[fold_ids == k].tolist())
             missing = set(classes_ordered) - test_lbls
             if missing:
                 print(f"    (warn) fold {k} test set missing classes: {sorted(missing)}")
 
+        selected_rf_overrides, sel_report = _blocked_candidate_search(
+            name, X, y, fold_ids, classes_ordered,
+        )
+        pipe = _build_pipeline(selected_rf_overrides)
+        print(
+            "  [model-select] blocked-CV best candidate="
+            f"{sel_report['candidate_index']}  "
+            f"min_class_recall={sel_report['blocked_min_class_recall']:.4f}  "
+            f"oof_acc={sel_report['blocked_oof_accuracy']:.4f}"
+        )
+        if selected_rf_overrides:
+            print(f"  [model-select] overrides: {selected_rf_overrides}")
+        else:
+            print("  [model-select] overrides: <baseline>")
+        metrics["rf_selected_overrides"] = dict(selected_rf_overrides)
+
         cv = BlockedIntraFileCV(fold_ids, BLOCKED_N_FOLDS, purge=BLOCKED_PURGE)
-        # (1) Per-fold scores
         fold_scores = cross_val_score(pipe, X, y, cv=cv, scoring="accuracy", n_jobs=-1)
-        # (2) Aggregated OOF predictions (fold-wise, so each window gets
-        #     exactly one prediction from the fold where it was in the test).
-        oof_pred = cross_val_predict(pipe, X, y, cv=cv, n_jobs=-1)
+        oof_proba = cross_val_predict(pipe, X, y, cv=cv, n_jobs=-1, method="predict_proba")
+        oof_pred = _labels_from_proba_with_branch_bias(name, classes_ordered, oof_proba)
         acc_oof = accuracy_score(y, oof_pred)
         cm_oof = confusion_matrix(y, oof_pred, labels=classes_ordered)
 
@@ -560,12 +563,85 @@ def _train_one_branch(
             "confusion_oof": cm_oof.tolist(),
         })
 
-        # ── Deployed model: fit on ALL windows ──────────────────────────────
-        print(f"  [final fit] training deployed model on ALL {len(y)} windows...")
-        pipe.fit(X, y)
-        classes_final = [str(c) for c in pipe.named_steps["rf"].classes_]
+        if eval_mode == "blocked_lofo":
+            if use_lofo:
+                unique_files = np.unique(groups)
+                print(f"  [LOFO-CV extra] {len(unique_files)} files → "
+                      f"{len(unique_files)} folds (for cross-subject/session check)")
+                logo = LeaveOneGroupOut()
+                lofo_fold_scores = cross_val_score(
+                    pipe, X, y, groups=groups, cv=logo, scoring="accuracy", n_jobs=-1,
+                )
+                lofo_oof_proba = cross_val_predict(
+                    pipe, X, y, groups=groups, cv=logo, n_jobs=-1, method="predict_proba",
+                )
+                lofo_oof_pred = _labels_from_proba_with_branch_bias(
+                    name, classes_ordered, lofo_oof_proba,
+                )
+                lofo_acc_oof = accuracy_score(y, lofo_oof_pred)
+                lofo_cm_oof = confusion_matrix(y, lofo_oof_pred, labels=classes_ordered)
+                print(f"  [LOFO extra per-file] mean = {lofo_fold_scores.mean():.4f}   "
+                      f"std = {lofo_fold_scores.std():.4f}   "
+                      f"min = {lofo_fold_scores.min():.4f}   max = {lofo_fold_scores.max():.4f}")
+                print(f"  [LOFO extra aggregate OOF] accuracy = {lofo_acc_oof:.4f}")
+                metrics.update({
+                    "evaluation": "blocked_plus_lofo",
+                    "lofo_n_files": int(len(unique_files)),
+                    "lofo_fold_accuracies": [float(s) for s in lofo_fold_scores],
+                    "lofo_mean": float(lofo_fold_scores.mean()),
+                    "lofo_std": float(lofo_fold_scores.std()),
+                    "lofo_min": float(lofo_fold_scores.min()),
+                    "lofo_max": float(lofo_fold_scores.max()),
+                    "lofo_oof_accuracy": float(lofo_acc_oof),
+                    "lofo_confusion_oof": lofo_cm_oof.tolist(),
+                })
+                if save_plots_dir is not None:
+                    os.makedirs(save_plots_dir, exist_ok=True)
+                    _save_confusion_png(
+                        lofo_cm_oof, [str(c) for c in classes_ordered],
+                        os.path.join(save_plots_dir, f"confusion_{name}_lofo_oof.png"),
+                        title=f"{name} · LOFO out-of-fold  "
+                              f"(acc={lofo_acc_oof:.3f}, per-file {lofo_fold_scores.mean():.3f}±{lofo_fold_scores.std():.3f})",
+                    )
+                    print(f"  [plots] saved confusion_{name}_lofo_oof.png "
+                          f"in {save_plots_dir}")
+            else:
+                print("  [LOFO-CV extra] skipped: not enough valid per-file groups.")
+                metrics["lofo_skipped"] = True
 
-        # ── Save PNG ────────────────────────────────────────────────────────
+        print(f"  [final fit] training deployed model on ALL {len(y)} windows...")
+        deployed_model = pipe
+        model_kind = "pipeline_rf"
+        calib_note = "none"
+        min_cls = int(np.min(counts)) if len(counts) else 0
+        if CALIBRATION_ENABLED and min_cls >= CALIBRATION_MIN_CLASS_SAMPLES:
+            try:
+                n_cv = max(2, min(3, min_cls // 2))
+                cal = CalibratedClassifierCV(
+                    estimator=_build_pipeline(selected_rf_overrides),
+                    method=CALIBRATION_METHOD,
+                    cv=n_cv,
+                )
+                cal.fit(X, y)
+                deployed_model = cal
+                model_kind = "calibrated_cv"
+                calib_note = f"{CALIBRATION_METHOD}_cv{n_cv}"
+                print(f"  [calibration] enabled: {calib_note}")
+            except Exception as exc:
+                print(f"  [calibration] skipped due to error: {exc}")
+                pipe.fit(X, y)
+        else:
+            pipe.fit(X, y)
+            if CALIBRATION_ENABLED:
+                print(
+                    "  [calibration] skipped: insufficient per-class samples "
+                    f"(min={min_cls}, need>={CALIBRATION_MIN_CLASS_SAMPLES})",
+                )
+        classes_attr = getattr(deployed_model, "classes_", None)
+        if classes_attr is None:
+            classes_attr = getattr(pipe.named_steps["rf"], "classes_", None)
+        classes_final = [str(c) for c in list(classes_attr)] if classes_attr is not None else []
+
         if save_plots_dir is not None:
             os.makedirs(save_plots_dir, exist_ok=True)
             _save_confusion_png(
@@ -579,14 +655,9 @@ def _train_one_branch(
                   f"in {save_plots_dir}")
 
     elif use_lofo:
-        # ── LOFO-CV ─────────────────────────────────────────────────────────
         unique_files = np.unique(groups)
         print(f"  [LOFO-CV] {len(unique_files)} files → "
               f"{len(unique_files)} folds (each = hold out one whole CSV)")
-        # Warn if some files lack all classes for this branch (very common —
-        # a CSV that only recorded "SITTING_NORMAL" has no "SITTING_CROSSLEGGED"
-        # so the fold trained without it still predicts across all classes;
-        # sklearn handles this gracefully).
         file_class_counts = {
             int(f): dict(zip(*np.unique(y[groups == f], return_counts=True)))
             for f in unique_files
@@ -601,14 +672,13 @@ def _train_one_branch(
                   "every class — aggregated OOF still covers all classes.")
 
         logo = LeaveOneGroupOut()
-        # (1) Per-fold accuracy (33 numbers)
         fold_scores = cross_val_score(
             pipe, X, y, groups=groups, cv=logo, scoring="accuracy", n_jobs=-1
         )
-        # (2) Aggregated OOF predictions (one prediction per window)
-        oof_pred = cross_val_predict(
-            pipe, X, y, groups=groups, cv=logo, n_jobs=-1
+        oof_proba = cross_val_predict(
+            pipe, X, y, groups=groups, cv=logo, n_jobs=-1, method="predict_proba",
         )
+        oof_pred = _labels_from_proba_with_branch_bias(name, classes_ordered, oof_proba)
         acc_oof = accuracy_score(y, oof_pred)
         cm_oof = confusion_matrix(y, oof_pred, labels=classes_ordered)
 
@@ -638,12 +708,39 @@ def _train_one_branch(
             "confusion_oof": cm_oof.tolist(),
         })
 
-        # ── Deployed model: fit on ALL windows (no data wasted) ─────────────
         print(f"  [final fit] training deployed model on ALL {len(y)} windows...")
-        pipe.fit(X, y)
-        classes_final = [str(c) for c in pipe.named_steps["rf"].classes_]
+        deployed_model = pipe
+        model_kind = "pipeline_rf"
+        calib_note = "none"
+        min_cls = int(np.min(counts)) if len(counts) else 0
+        if CALIBRATION_ENABLED and min_cls >= CALIBRATION_MIN_CLASS_SAMPLES:
+            try:
+                n_cv = max(2, min(3, min_cls // 2))
+                cal = CalibratedClassifierCV(
+                    estimator=_build_pipeline(selected_rf_overrides),
+                    method=CALIBRATION_METHOD,
+                    cv=n_cv,
+                )
+                cal.fit(X, y)
+                deployed_model = cal
+                model_kind = "calibrated_cv"
+                calib_note = f"{CALIBRATION_METHOD}_cv{n_cv}"
+                print(f"  [calibration] enabled: {calib_note}")
+            except Exception as exc:
+                print(f"  [calibration] skipped due to error: {exc}")
+                pipe.fit(X, y)
+        else:
+            pipe.fit(X, y)
+            if CALIBRATION_ENABLED:
+                print(
+                    "  [calibration] skipped: insufficient per-class samples "
+                    f"(min={min_cls}, need>={CALIBRATION_MIN_CLASS_SAMPLES})",
+                )
+        classes_attr = getattr(deployed_model, "classes_", None)
+        if classes_attr is None:
+            classes_attr = getattr(pipe.named_steps["rf"], "classes_", None)
+        classes_final = [str(c) for c in list(classes_attr)] if classes_attr is not None else []
 
-        # ── Save PNG ────────────────────────────────────────────────────────
         if save_plots_dir is not None:
             os.makedirs(save_plots_dir, exist_ok=True)
             _save_confusion_png(
@@ -656,7 +753,6 @@ def _train_one_branch(
                   f"in {save_plots_dir}")
 
     else:
-        # ── Legacy 60/20/20 stratified shuffle split (only when no groups) ──
         print("  [evaluation] random 3-way split (groups not provided)")
         X_rem, X_te, y_rem, y_te = train_test_split(
             X, y, test_size=TEST_FRAC, random_state=RANDOM_STATE, stratify=y,
@@ -674,6 +770,9 @@ def _train_one_branch(
             metrics["cv_mean"] = float(cv_scores.mean())
             metrics["cv_std"] = float(cv_scores.std())
         pipe.fit(X_tr, y_tr)
+        deployed_model = pipe
+        model_kind = "pipeline_rf"
+        calib_note = "none"
         classes_final = [str(c) for c in pipe.named_steps["rf"].classes_]
         pred_val = pipe.predict(X_val)
         pred_te = pipe.predict(X_te)
@@ -703,18 +802,17 @@ def _train_one_branch(
                                  os.path.join(save_plots_dir, f"confusion_{name}_test.png"),
                                  title=f"{name} · test  (acc={acc_te:.3f})")
 
-    # ── Persist deployed model ──────────────────────────────────────────────────
     bundle = {
-        "pipeline": pipe,
+        "pipeline": deployed_model,
         "branch": name,
         "classes": classes_final,
         "aux_dim": AUX_DIM,
         "feature_mode": "branch_adaptive_v2",
+        "model_kind": model_kind,
+        "probability_calibration": calib_note,
         "calibration": calibration_info,
         "metrics": {
             k: v for k, v in metrics.items()
-            # Drop only the very large per-fold arrays; keep confusion_oof so
-            # notebooks can re-render it from the joblib bundle directly.
             if k not in ("confusion_val", "confusion_test")
         },
     }
@@ -729,15 +827,9 @@ def _build_calibration_for_training(
     args: argparse.Namespace,
     raw: np.ndarray,
     labels: list[str],
+    data_dir: str = DATA_DIR,
 ) -> "object | None":
-    """Resolve which PersonalCalibration to use.
-
-    Priority:
-      1. ``--no-calib``            → no calibration (legacy mode)
-      2. ``--calib <json>``        → load the JSON and use it verbatim
-      3. default                   → auto-fit from the CSVs we already loaded
-                                     and dump to ``personal_calibration.json``
-    """
+    """Resolve PersonalCalibration: None, JSON path, or auto-fit on raw."""
     if args.no_calib:
         print("[calib] --no-calib → training without personal normalization.")
         return None
@@ -756,31 +848,29 @@ def _build_calibration_for_training(
     calib = pc.OfflineAutoCalibrator().fit(
         raw, labels,
         subject="offline_auto_population",
-        notes=f"auto-fit from {DATA_DIR} during training",
+        notes=f"auto-fit from {data_dir} during training",
     )
     out_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                             pc.DEFAULT_CALIBRATION_FILENAME)
     calib.save_json(out_path)
     print(f"[calib] auto-fit offline calibration saved → {out_path}")
-    for w in calib.__dict__.get("warnings", []) or []:   # not used by dataclass
+    for w in calib.__dict__.get("warnings", []) or []:
         print("  warn:", w)
     print(calib.summary())
     return calib
 
 
 def main(argv: "list[str] | None" = None) -> int:
-    """Entry point. Pass ``argv=[]`` when calling from a Jupyter notebook so
-    argparse does not pick up the kernel's own CLI flags."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--calib",
         default=None,
-        help="Path to personal_calibration.json to reuse (e.g. produced by the UI wizard).",
+        help="Path to personal_calibration.json",
     )
     parser.add_argument(
         "--no-calib",
         action="store_true",
-        help="Disable personal calibration entirely (ablation / legacy).",
+        help="Disable personal calibration",
     )
     parser.add_argument(
         "--plots-dir",
@@ -789,29 +879,26 @@ def main(argv: "list[str] | None" = None) -> int:
     )
     parser.add_argument(
         "--eval-mode",
-        choices=("blocked", "lofo", "random"),
-        default="blocked",
-        help="Evaluation strategy. "
-             "'blocked' (default, recommended) = per-segment contiguous-block CV: every "
-             "label-segment in every CSV is sliced into K contiguous chunks, fold k tests "
-             "on the k-th chunk of every segment, so every fold's test set covers all "
-             "classes while each test block stays temporally contiguous. "
-             "'lofo' = Leave-One-File-Out (strict subject independence, but many held-out "
-             "CSVs contain only 1-2 labels → high variance). "
-             "'random' = legacy 60/20/20 stratified shuffle split (leaks neighbour frames).",
+        choices=("blocked_lofo", "blocked", "lofo", "random"),
+        default="blocked_lofo",
+        help="blocked_lofo | blocked | lofo | random",
+    )
+    parser.add_argument(
+        "--data-dir",
+        default=None,
+        help="Folder with *sensor_data_dual_labeled_*.csv. Default: ml_activity_features.DATA_DIR (project saving_data).",
     )
     args = parser.parse_args(argv)
 
-    # Still load the full concat once — the OfflineAutoCalibrator needs the
-    # whole dataset to compute the 5 global stats (this does NOT shuffle; it
-    # just concatenates file contents end-to-end so quantiles / mean / std
-    # are derived from the whole population).
-    raw, labels, _subj, mode = load_csv_files(DATA_DIR, labeled_only=True, raw_adc=True)
+    data_dir = (args.data_dir or DATA_DIR).strip() or DATA_DIR
+    data_dir = os.path.normpath(os.path.abspath(data_dir))
+
+    raw, labels, _subj, mode = load_csv_files(data_dir, labeled_only=True, raw_adc=True)
     if raw.size == 0 or mode != "dual":
-        print("No dual-foot labeled CSV found under", DATA_DIR)
+        print("No dual-foot labeled CSV found under", data_dir)
         return 1
 
-    calib = _build_calibration_for_training(args, raw, labels)
+    calib = _build_calibration_for_training(args, raw, labels, data_dir=data_dir)
     calib_info = None if calib is None else {
         "source": calib.source,
         "subject": calib.subject,
@@ -819,14 +906,11 @@ def main(argv: "list[str] | None" = None) -> int:
         "max_raw": list(map(float, calib.max_raw)),
     }
 
-    # ── Load the same CSVs file-by-file so we can tag each window with its
-    #    origin file index → preserves per-file time integrity.
-    per_file = _load_csv_per_file(DATA_DIR)
+    per_file = _load_csv_per_file(data_dir)
     if not per_file:
-        print("No labeled CSVs found under", DATA_DIR)
+        print("No labeled CSVs found under", data_dir)
         return 1
-    print(f"Loaded {len(per_file)} CSV files in original temporal order "
-          f"(no intra-file shuffling).")
+    print(f"Loaded {len(per_file)} CSV files (temporal order preserved).")
 
     X_all, y_all, b_all, g_all, s_all = _windows_for_branch_per_file(
         per_file, calibration=calib,
@@ -853,20 +937,14 @@ def main(argv: "list[str] | None" = None) -> int:
     if args.plots_dir:
         plots_dir = os.path.join(out_dir, args.plots_dir)
 
-    # ── Decide evaluation mode
-    if args.eval_mode == "blocked":
-        print(f"\n[eval] Using BLOCKED intra-file CV (K={BLOCKED_N_FOLDS}, "
-              f"purge={BLOCKED_PURGE}). Every label-segment is split into "
-              f"{BLOCKED_N_FOLDS} contiguous chunks; fold k tests on the k-th "
-              "chunk of every segment. Every fold's test set therefore "
-              "contains every class; each test block is a contiguous run of "
-              "frames; final model fits all windows.")
+    if args.eval_mode == "blocked_lofo":
+        print(f"\n[eval] blocked_lofo: K={BLOCKED_N_FOLDS} purge={BLOCKED_PURGE}")
+    elif args.eval_mode == "blocked":
+        print(f"\n[eval] blocked: K={BLOCKED_N_FOLDS} purge={BLOCKED_PURGE}")
     elif args.eval_mode == "lofo":
-        print("\n[eval] Using Leave-One-File-Out cross-validation "
-              "(held-out CSVs may contain only 1-2 labels — high variance).")
+        print("\n[eval] lofo")
     else:
-        print("\n[eval] Using legacy 60/20/20 stratified shuffle split "
-              "(IGNORES time continuity, kept only for ablation).")
+        print("\n[eval] random split (ablation)")
 
     all_metrics: list[dict] = []
     for br, fname in BRANCH_TO_FILE.items():
@@ -874,8 +952,8 @@ def main(argv: "list[str] | None" = None) -> int:
         if not np.any(mask):
             print(f"\n=== Branch {br}: no samples ===")
             continue
-        groups_br = g_all[mask] if args.eval_mode == "lofo" else None
-        seg_br = s_all[mask] if args.eval_mode == "blocked" else None
+        groups_br = g_all[mask] if args.eval_mode in ("lofo", "blocked_lofo") else None
+        seg_br = s_all[mask] if args.eval_mode in ("blocked", "blocked_lofo") else None
         m = _train_one_branch(
             br, X_all[mask], y_all[mask],
             os.path.join(out_dir, fname),
@@ -887,11 +965,27 @@ def main(argv: "list[str] | None" = None) -> int:
         )
         all_metrics.append(m)
 
-    # ── Final summary table ──────────────────────────────────────────────────
     print("\n" + "=" * 94)
-    print("                          FINAL SUMMARY — four branch RFs")
+    print("SUMMARY")
     print("=" * 94)
-    if args.eval_mode == "blocked":
+    if args.eval_mode == "blocked_lofo":
+        print(f"{'branch':<18}{'N':>7}{'segs':>7}{'b-mean':>10}{'b-std':>9}"
+              f"{'b-oof':>10}{'files':>8}{'l-mean':>10}{'l-std':>9}{'l-oof':>10}")
+        print("-" * 104)
+        for m in all_metrics:
+            if m.get("skipped"):
+                print(f"{m['branch']:<18}{m.get('n_samples', 0):>7}  (skipped)")
+                continue
+            print(f"{m['branch']:<18}{m['n_samples']:>7}"
+                  f"{m.get('blocked_n_segments', 0):>7}"
+                  f"{m.get('blocked_mean', float('nan')):>10.4f}"
+                  f"{m.get('blocked_std', float('nan')):>9.4f}"
+                  f"{m.get('oof_accuracy', float('nan')):>10.4f}"
+                  f"{m.get('lofo_n_files', 0):>8}"
+                  f"{m.get('lofo_mean', float('nan')):>10.4f}"
+                  f"{m.get('lofo_std', float('nan')):>9.4f}"
+                  f"{m.get('lofo_oof_accuracy', float('nan')):>10.4f}")
+    elif args.eval_mode == "blocked":
         print(f"{'branch':<20}{'N':>7}{'segs':>7}{'folds':>7}"
               f"{'mean':>11}{'std':>10}{'min':>10}{'OOF acc':>12}")
         print("-" * 94)

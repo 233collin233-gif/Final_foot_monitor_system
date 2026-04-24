@@ -1,31 +1,10 @@
-"""
-Foot Pressure Real-time Monitor — SLIM build
-============================================
-Receives **two MCU** streams over TCP (same IP: left foot+knee **5000**, right **6000**),
-bilateral pair-wise sync by PC receive time, writes labeled + raw CSV, and runs the
-hierarchical RF recognizer (``realtime_recognizer.OnlineRecognizer``).
-
-This rewrite **removes** all heavy visualisations that were causing the UI to lag:
-  • no foot heatmap (``pyqtgraph`` is no longer imported)
-  • no per-sensor histogram dialog
-  • no timer-driven redraw loop
-
-What is still here (and all the user actually needs for live testing):
-  • IP / port inputs, Start / Stop, connection dots
-  • **Live raw ADC display** — 8 channel values updated on every synced frame
-  • **Cascade status HUD** — Layer-1 (Active / Inactive knee gate) + Layer-2 (Motion /
-    Static) + the four-branch RF's final label, probability and step counters
-  • Data-capture label strip (writes the same 9-column / 10-column dual CSV format)
-  • Personal calibration wizard (two-step: stand → knee bend)
-
-Per-MCU pin mapping:   A1 → toe    A2 → forefoot    A5 → heel    A8 → knee
-Arduino line format:   ``timestamp_ms,toe,forefoot,heel,knee``
-"""
+"""PyQt: dual TCP insoles, optional CSV capture, calibration wizard, live inference."""
 
 from __future__ import annotations
 
 import csv
 import datetime
+import json
 import math
 import os
 import socket
@@ -36,9 +15,6 @@ import warnings
 from collections import deque
 from typing import Optional, Tuple
 
-# sklearn 的模型是用 1.5.1 训的，这边环境是 1.8.0，跨版本 unpickle
-# 会对每个 estimator 都刷一条 InconsistentVersionWarning。
-# 模型我试过跑起来没问题，警告只是刷屏，而且会把控制台拖慢，直接关掉。
 warnings.filterwarnings("ignore", category=UserWarning, module=r"sklearn\..*")
 try:
     from sklearn.exceptions import InconsistentVersionWarning
@@ -50,6 +26,7 @@ from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtGui import QBrush, QColor, QFont, QPainter
 from PyQt5.QtWidgets import (
     QApplication,
+    QCheckBox,
     QFrame,
     QGridLayout,
     QHBoxLayout,
@@ -70,15 +47,14 @@ from PyQt5.QtWidgets import (
 import personal_calibration as personal_calib
 from realtime_recognizer import OnlineRecognizer
 
-# 12-bit ADC range
 SENSOR_MAX = 4095.0
-# L/R pairing uses PC receive time (monotonic); MCU millis differ per board.
 SYNC_PC_MAX_S = 0.15
 
+TAB_LISTEN = 0
+TAB_CAPTURE = 1
+TAB_INFERENCE = 2
+TAB_CALIBRATION = 3
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  DARK THEME
-# ═══════════════════════════════════════════════════════════════════════════
 
 DARK_STYLE = """
 QMainWindow { background-color: #0a0a1a; }
@@ -136,24 +112,39 @@ QTabBar::tab:selected { background:#1e1e40; color:#ff6b6b; font-weight:bold; }
 """
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  TCP LINE PARSING
-# ═══════════════════════════════════════════════════════════════════════════
-
-FootFour = Tuple[Optional[float], Optional[float], Optional[float], Optional[float]]
+FootThree = Tuple[Optional[float], Optional[float], Optional[float]]
 
 
-def parse_line_timestamped(line: str) -> Optional[Tuple[int, FootFour]]:
-    """Arduino line → ``(ts_ms, (toe, forefoot, heel, knee))``; ``None`` on any parse error."""
-    parts = [p.strip() for p in line.split(",")]
-    if len(parts) < 5:
+def parse_foot_json_line(line: str) -> Optional[FootThree]:
+    """Parse one MCU line: JSON {forefoot,heel,knee} or three comma floats."""
+    s = line.strip().lstrip("\ufeff")
+    if not s:
         return None
-    try:
-        ts = int(float(parts[0]))
-    except ValueError:
+    if s.startswith("{"):
+        try:
+            d = json.loads(s)
+        except json.JSONDecodeError:
+            return None
+        def _f(key: str) -> Optional[float]:
+            for k, v in d.items():
+                if str(k).lower() == key:
+                    try:
+                        x = float(v)
+                        if math.isnan(x) or math.isinf(x):
+                            return None
+                        return x
+                    except (TypeError, ValueError):
+                        return None
+            return None
+        ff, h, k = _f("forefoot"), _f("heel"), _f("knee")
+        if ff is None or h is None or k is None:
+            return None
+        return (ff, h, k)
+    parts = [p.strip() for p in s.split(",")]
+    if len(parts) < 3:
         return None
     vals: list[float] = []
-    for p in parts[1:5]:
+    for p in parts[:3]:
         try:
             v = float(p)
             if math.isnan(v) or math.isinf(v):
@@ -161,11 +152,10 @@ def parse_line_timestamped(line: str) -> Optional[Tuple[int, FootFour]]:
             vals.append(v)
         except ValueError:
             return None
-    return (ts, (vals[0], vals[1], vals[2], vals[3]))
+    return (vals[0], vals[1], vals[2])
 
 
 def _deque_remove_one(d: deque, item: tuple) -> bool:
-    """Remove exactly one occurrence of ``item`` from ``d`` (preserve ``maxlen``)."""
     before = len(d)
     ml = d.maxlen
     tmp = deque((x for x in d if x != item), maxlen=ml)
@@ -176,24 +166,17 @@ def _deque_remove_one(d: deque, item: tuple) -> bool:
     return True
 
 
-def foot_tuple_for_recognizer(tup: Optional[FootFour]) -> Optional[Tuple[float, float, float, float]]:
-    """Replace any ``None`` channel with ``SENSOR_MAX`` (= no pressure / straight knee)."""
+def foot_tuple_for_recognizer(tup: Optional[FootThree]) -> Optional[Tuple[float, float, float]]:
     if tup is None:
         return None
     return tuple(SENSOR_MAX if x is None else float(x) for x in tup)
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  SOCKET THREAD — one per MCU
-# ═══════════════════════════════════════════════════════════════════════════
-
 class SocketThread(QThread):
-    """TCP server per MCU; emits raw samples (no CSV — main window handles it)."""
 
-    # side, timestamp_ms, toe, forefoot, heel, knee (ts as object avoids int-overflow)
-    data_received = pyqtSignal(str, object, float, float, float, float)
+    data_received = pyqtSignal(str, float, float, float)
     status_changed = pyqtSignal(str)
-    connection_state = pyqtSignal(str)  # "connected" | "waiting" | "disconnected"
+    connection_state = pyqtSignal(str)
 
     def __init__(self, host: str, port: int, side: str, parent=None):
         super().__init__()
@@ -252,16 +235,18 @@ class SocketThread(QThread):
                             continue
                         if not header_skipped:
                             lo = line.lower()
-                            if "toe" in lo and ("knee" in lo or "timestamp" in lo):
+                            if lo.startswith("{") and "forefoot" in lo:
+                                header_skipped = True
+                                continue
+                            if "forefoot" in lo and "knee" in lo and not lo.startswith("{"):
                                 header_skipped = True
                                 continue
                             header_skipped = True
-                        parsed = parse_line_timestamped(line)
+                        parsed = parse_foot_json_line(line)
                         if parsed is not None:
-                            ts_ms, (s_toe, s_forefoot, s_heel, s_knee) = parsed
+                            s_ff, s_heel, s_knee = parsed
                             self.data_received.emit(
-                                self.side, ts_ms,
-                                s_toe, s_forefoot, s_heel, s_knee,
+                                self.side, s_ff, s_heel, s_knee,
                             )
                 except socket.timeout:
                     continue
@@ -288,13 +273,7 @@ class SocketThread(QThread):
         self._cleanup()
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  SMALL CUSTOM WIDGETS
-# ═══════════════════════════════════════════════════════════════════════════
-
 class StatusDot(QWidget):
-    """Tri-state LED dot (disconnected / waiting / connected)."""
-
     _COLORS = {
         "disconnected": QColor("#ff4455"),
         "waiting":      QColor("#ffaa00"),
@@ -322,13 +301,124 @@ class StatusDot(QWidget):
         p.end()
 
 
+class ForeHeelHeatmapBlock(QWidget):
+    def __init__(self, fore_color: str, heel_color: str, parent=None):
+        super().__init__(parent)
+        self._fore_color = QColor(fore_color)
+        self._heel_color = QColor(heel_color)
+        self._i_fore = -1.0
+        self._i_heel = -1.0
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(4)
+
+        self._strip = _ForeHeelHeatStrip(self._fore_color, self._heel_color, parent=self)
+        self._strip.setMinimumHeight(56)
+        self._strip.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        root.addWidget(self._strip, 0)
+
+        self._detail = QLabel("Forefoot —\nHeel —")
+        self._detail.setTextFormat(Qt.PlainText)
+        self._detail.setStyleSheet("color:#a8a8c8; font-size:10px; line-height:115%;")
+        self._detail.setWordWrap(True)
+        root.addWidget(self._detail)
+
+    def set_sensors(
+        self,
+        raw_forefoot: Optional[float],
+        raw_heel: Optional[float],
+    ) -> None:
+        def intensity(raw: Optional[float]) -> float:
+            if raw is None:
+                return -1.0
+            return max(0.0, min(1.0, (SENSOR_MAX - float(raw)) / SENSOR_MAX))
+
+        a, b = intensity(raw_forefoot), intensity(raw_heel)
+        if a != self._i_fore or b != self._i_heel:
+            self._i_fore, self._i_heel = a, b
+            self._strip.set_intensity(a, b)
+
+        if raw_forefoot is None and raw_heel is None:
+            text = "Forefoot —\nHeel —"
+        else:
+            lines: list[str] = []
+            for label, raw, i in (
+                ("Forefoot", raw_forefoot, a),
+                ("Heel", raw_heel, b),
+            ):
+                if raw is None:
+                    lines.append(f"{label} —")
+                else:
+                    ri = int(round(float(raw)))
+                    pct = int(round(100.0 * max(0.0, i))) if i >= 0 else 0
+                    lines.append(f"{label}  {ri}  load {pct:3d}%")
+            text = "\n".join(lines)
+        if text != getattr(self, "_last_detail", None):
+            self._last_detail = text
+            self._detail.setText(text)
+
+
+class _ForeHeelHeatStrip(QWidget):
+    def __init__(self, c_fore: QColor, c_heel: QColor, parent=None):
+        super().__init__(parent)
+        self._c_fore = c_fore
+        self._c_heel = c_heel
+        self._a = -1.0
+        self._b = -1.0
+
+    def set_intensity(self, a: float, b: float) -> None:
+        if a == self._a and b == self._b:
+            return
+        self._a, self._b = a, b
+        self.update()
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        w, h = self.width(), self.height()
+        gap = 5
+        half_w = max(8, (w - gap) // 2)
+        bg = QColor("#141428")
+        border = QColor("#2a2a48")
+        for idx, (intens, c, x0) in enumerate(
+            (
+                (self._a, self._c_fore, 0),
+                (self._b, self._c_heel, half_w + gap),
+            )
+        ):
+            p.setPen(border)
+            p.setBrush(QBrush(bg))
+            p.drawRoundedRect(x0, 0, half_w, h, 7, 7)
+            if intens < 0.0:
+                p.setPen(QColor("#505070"))
+                p.setBrush(Qt.NoBrush)
+                p.drawText(
+                    x0 + 4,
+                    0,
+                    half_w - 8,
+                    h,
+                    Qt.AlignCenter,
+                    "—" if idx == 0 else "—",
+                )
+                continue
+            fill = QColor(c)
+            fill.setAlpha(35 + int(220 * intens))
+            p.setPen(Qt.NoPen)
+            p.setBrush(QBrush(fill))
+            inset = 3
+            p.drawRoundedRect(
+                x0 + inset,
+                inset,
+                half_w - 2 * inset,
+                h - 2 * inset,
+                5,
+                5,
+            )
+        p.end()
+
+
 class ChannelReadout(QLabel):
-    """单通道实时 ADC 读数 — 标题 + raw 值 + 百分比。
-
-    之前是用富文本 HTML 刷，每帧 8 个 label 解析 <span> 很卡主线程；
-    现在改成纯文本三行 + 一次性 setStyleSheet，快得多而且视觉上一致。
-    """
-
     def __init__(self, title: str, accent: str, is_knee: bool = False, parent=None):
         super().__init__(parent)
         self._title = title
@@ -337,11 +427,9 @@ class ChannelReadout(QLabel):
         self.setAlignment(Qt.AlignCenter)
         self.setTextFormat(Qt.PlainText)
         self.setMinimumWidth(110)
-        # 样式只设一次，以后只改文本，避免每帧重新解析 stylesheet
         self.setStyleSheet(
             "color:#ffffff; font-size:13px; font-weight:bold; line-height:115%;"
         )
-        # 用一个小状态缓存，避免文本没变也 setText（QLabel 会触发 relayout）
         self._last_text: Optional[str] = None
         self.set_raw(None)
 
@@ -351,7 +439,6 @@ class ChannelReadout(QLabel):
         else:
             raw_i = int(round(float(raw)))
             if self._is_knee:
-                # 膝盖：raw 越小弯得越厉害，4095 = 直
                 bend = max(0.0, (SENSOR_MAX - raw)) / SENSOR_MAX * 100.0
                 tag = f"bend {bend:4.0f}%"
             else:
@@ -363,36 +450,7 @@ class ChannelReadout(QLabel):
             self.setText(text)
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  PERSONAL CALIBRATION WIZARD (two-step: stand → knee bend)
-# ═══════════════════════════════════════════════════════════════════════════
-
 class CalibrationPanel(QWidget):
-    """Embedded two-step personal-calibration wizard.
-
-    Layout fix
-    ----------
-    The panel's content lives inside a :class:`QScrollArea` so no button
-    is ever clipped, regardless of the host window's height or Windows
-    display scaling (100% / 125% / 150%).  The outer panel itself has
-    an Expanding size policy so the parent tab widget can give it the
-    remaining vertical space.
-
-    Live-data guard
-    ---------------
-    ``Start Step 1 / Step 2`` are blocked unless :meth:`set_live_state`
-    has been called with ``True`` (i.e. MainWindow confirmed at least
-    one synced bilateral frame arrived).  Feeding the :class:`OnlineCalibrator`
-    is also a no-op while ``self._live_ok`` is ``False`` — the progress bar
-    can never fake-advance.
-
-    On **Save** a ``personal_calibration.json`` is written to the project
-    root and :class:`MainWindow` hot-reloads its :class:`OnlineRecognizer`
-    so the new per-wearer range takes effect immediately.  The Layer-1 knee
-    4095 rule is still applied to the *pre*-calibration raw ADC inside the
-    recognizer; calibration only changes the ML feature scale.
-    """
-
     STEP1_SECONDS = 5.0
     STEP2_SECONDS = 5.0
     JSON_PATH = os.path.join(
@@ -400,24 +458,20 @@ class CalibrationPanel(QWidget):
         personal_calib.DEFAULT_CALIBRATION_FILENAME,
     )
 
-    calibration_saved = pyqtSignal(str)  # emits absolute path
+    calibration_saved = pyqtSignal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._calibrator: Optional[personal_calib.OnlineCalibrator] = None
         self._last_preview: Optional[personal_calib.PersonalCalibration] = None
-        self._live_ok: bool = False        # set via set_live_state()
+        self._live_ok: bool = False
         self._step_ready_notified: set[str] = set()
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self._build_ui()
         self._apply_initial_button_state()
         self._refresh_existing_calibration_status()
 
-    # ═══════════════════ UI CONSTRUCTION ════════════════════════════
     def _build_ui(self):
-        # Outer layout holds ONE widget: a QScrollArea with the real
-        # content inside.  This is what keeps every button visible even
-        # on 125–150% Windows display scaling and short windows.
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
@@ -443,11 +497,10 @@ class CalibrationPanel(QWidget):
         root.setContentsMargins(14, 10, 14, 14)
         root.setSpacing(10)
 
-        # ── usage-order banner (bright, so users can't miss it) ───────
         banner = QLabel(
-            "Usage order:  connect both MCUs → click top-right <b>Start</b> → "
-            "wait until live bilateral packets arrive → open Calibration → "
-            "Step 1 → Step 2 → Save"
+            "Usage: connect MCUs → on <b>Listen</b>, <b>Data capture</b>, or <b>Inference</b> "
+            "tab press <b>Start</b> → wait for bilateral packets → open this <b>Calibration</b> "
+            "tab → Step 1 → Step 2 → Save"
         )
         banner.setTextFormat(Qt.RichText)
         banner.setWordWrap(True)
@@ -457,7 +510,6 @@ class CalibrationPanel(QWidget):
         )
         root.addWidget(banner)
 
-        # ── per-wearer intro (what the wizard does) ───────────────────
         header = QLabel(
             "Personal calibration wizard — aligns per-channel [min, max] ADC to this "
             "wearer.  Layer-1 knee 4095 rule is unaffected; only ML feature scale changes."
@@ -466,13 +518,11 @@ class CalibrationPanel(QWidget):
         header.setStyleSheet("color:#d0d0e0; font-size:12px;")
         root.addWidget(header)
 
-        # ── existing-calibration status line ──────────────────────────
         self.status_lbl = QLabel("—")
         self.status_lbl.setWordWrap(True)
         self.status_lbl.setStyleSheet("color:#9090b0; font-size:11px;")
         root.addWidget(self.status_lbl)
 
-        # ── live-data indicator line (flips when MainWindow notifies) ──
         self.live_lbl = QLabel(
             "Live data: NO.  Press Start on the top bar and wait for packets."
         )
@@ -483,7 +533,6 @@ class CalibrationPanel(QWidget):
         self.live_lbl.setWordWrap(True)
         root.addWidget(self.live_lbl)
 
-        # ── subject row ───────────────────────────────────────────────
         subj_row = QHBoxLayout()
         subj_row.addWidget(self._small("Subject:"))
         self.subject_in = QLineEdit("default")
@@ -492,7 +541,6 @@ class CalibrationPanel(QWidget):
         subj_row.addStretch()
         root.addLayout(subj_row)
 
-        # ── Step 1 card ───────────────────────────────────────────────
         step1_box = self._card(
             title="Step 1 — Stand still (capture personal pressure range)",
             title_color="#ff9060",
@@ -528,7 +576,6 @@ class CalibrationPanel(QWidget):
         s1.addWidget(self.s1_count_lbl)
         root.addWidget(step1_box)
 
-        # ── Step 2 card ───────────────────────────────────────────────
         step2_box = self._card(
             title="Step 2 — Bend knee ~90° (capture personal stretch range)",
             title_color="#60c0ff",
@@ -564,7 +611,6 @@ class CalibrationPanel(QWidget):
         s2.addWidget(self.s2_count_lbl)
         root.addWidget(step2_box)
 
-        # ── save + reset row ──────────────────────────────────────────
         save_row = QHBoxLayout()
         save_row.setSpacing(10)
         self.save_btn = QPushButton("Save personal_calibration.json + reload")
@@ -579,7 +625,6 @@ class CalibrationPanel(QWidget):
         save_row.addStretch()
         root.addLayout(save_row)
 
-        # ── log text box (events / errors) — small fixed height ──────
         log_hdr = QLabel("Log")
         log_hdr.setStyleSheet(
             "color:#a0a0c0;font-size:11px;font-weight:bold;margin-top:4px;"
@@ -597,7 +642,6 @@ class CalibrationPanel(QWidget):
         )
         root.addWidget(self.log)
 
-        # ── calibration summary preview (bigger, monospace, scrollable) ─
         preview_hdr = QLabel("Calibration summary (populated after Finish Step 2)")
         preview_hdr.setStyleSheet(
             "color:#a0a0c0;font-size:11px;font-weight:bold;margin-top:4px;"
@@ -614,8 +658,6 @@ class CalibrationPanel(QWidget):
         )
         root.addWidget(self.preview)
 
-        # Trailing stretch: lets the scroll area show the last widgets
-        # fully without them being forced to fill all vertical space.
         root.addStretch(0)
 
     @staticmethod
@@ -646,9 +688,7 @@ class CalibrationPanel(QWidget):
         lbl.setStyleSheet("color:#707090; font-size:11px;")
         return lbl
 
-    # ═══════════════════ PUBLIC API (MainWindow) ═══════════════════════
     def feed(self, raw_l: tuple, raw_r: tuple) -> None:
-        """Push one synced bilateral frame to the active phase, if any."""
         if self._calibrator is None or not self._live_ok:
             return
         phase = self._calibrator.phase
@@ -656,13 +696,12 @@ class CalibrationPanel(QWidget):
             return
         if raw_l is None or raw_r is None:
             return
-        raw8 = [
-            float(raw_l[0]), float(raw_l[1]), float(raw_l[2]), float(raw_l[3]),
-            float(raw_r[0]), float(raw_r[1]), float(raw_r[2]), float(raw_r[3]),
+        raw6 = [
+            float(raw_l[0]), float(raw_l[1]), float(raw_l[2]),
+            float(raw_r[0]), float(raw_r[1]), float(raw_r[2]),
         ]
-        self._calibrator.feed(raw8)
+        self._calibrator.feed(raw6)
         self._refresh_progress_labels()
-        # Auto-enable Finish when the target is hit, and log once.
         if phase == "STEP1_STANDING" and self._calibrator.step1_ready:
             self.s1_finish_btn.setEnabled(True)
             if "step1" not in self._step_ready_notified:
@@ -677,7 +716,6 @@ class CalibrationPanel(QWidget):
                           "You can press Finish Step 2 now.")
 
     def set_live_state(self, is_live: bool) -> None:
-        """Called by MainWindow when bilateral live packets start / stop."""
         self._live_ok = bool(is_live)
         if self._live_ok:
             self.live_lbl.setText(
@@ -696,7 +734,6 @@ class CalibrationPanel(QWidget):
                 "border-radius:5px; padding:4px 8px; font-size:11px;"
             )
 
-    # ═══════════════════ WIZARD ACTIONS ════════════════════════════════
     def _start_step1(self):
         if not self._live_ok:
             self._warn_no_live()
@@ -715,7 +752,7 @@ class CalibrationPanel(QWidget):
         self.s1_progress.setValue(0)
         self.s2_progress.setValue(0)
         self.s1_start_btn.setEnabled(False)
-        self.s1_finish_btn.setEnabled(False)   # enabled once min_samples reached
+        self.s1_finish_btn.setEnabled(False)
         self.s2_start_btn.setEnabled(False)
         self.s2_finish_btn.setEnabled(False)
         self.save_btn.setEnabled(False)
@@ -764,7 +801,7 @@ class CalibrationPanel(QWidget):
             return
         self.s2_progress.setValue(0)
         self.s2_start_btn.setEnabled(False)
-        self.s2_finish_btn.setEnabled(False)   # enabled once min_samples reached
+        self.s2_finish_btn.setEnabled(False)
         self.status_lbl.setText("Capturing Step 2 — hold knee bent ~90°.")
         self._refresh_progress_labels()
         self._log("Step 2 started.")
@@ -783,7 +820,7 @@ class CalibrationPanel(QWidget):
 
         subject = self.subject_in.text().strip() or "default"
         if not self.subject_in.text().strip():
-            self.subject_in.setText(subject)   # persist auto-fill to UI
+            self.subject_in.setText(subject)
         try:
             self._last_preview = self._calibrator.finalize(subject=subject)
         except RuntimeError as exc:
@@ -834,7 +871,6 @@ class CalibrationPanel(QWidget):
         self._refresh_existing_calibration_status()
         self._log("Wizard reset.  Press Start Step 1 when live data is flowing.")
 
-    # ═══════════════════ HELPERS ══════════════════════════════════════
     def _apply_initial_button_state(self):
         self.s1_start_btn.setEnabled(True)
         self.s1_finish_btn.setEnabled(False)
@@ -861,7 +897,6 @@ class CalibrationPanel(QWidget):
         if phase == "STEP1_STANDING":
             pct = int(round(100.0 * min(1.0, s1_n / max(1, s1_t))))
             self.s1_progress.setValue(pct)
-            # Allow manual finish as soon as the minimum sample count is hit.
             if s1_n >= self._calibrator.step1_min_samples:
                 self.s1_finish_btn.setEnabled(True)
         elif phase == "STEP2_KNEE_BEND":
@@ -887,11 +922,9 @@ class CalibrationPanel(QWidget):
         self._log(f"{title}: {msg}")
 
     def _log(self, msg: str):
-        # Prepend newest entries so users don't have to scroll; keep short.
         stamped = time.strftime("%H:%M:%S") + "  " + msg
         existing = self.log.toPlainText()
         combined = stamped + ("\n" + existing if existing else "")
-        # cap log length
         if len(combined) > 8000:
             combined = combined[:8000]
         self.log.setPlainText(combined)
@@ -914,10 +947,6 @@ class CalibrationPanel(QWidget):
         except Exception as exc:  # noqa: BLE001
             self.status_lbl.setText(f"(existing JSON unreadable: {exc})")
 
-
-# ═══════════════════════════════════════════════════════════════════════════
-#  MAIN WINDOW — slim live display + cascade HUD + label strip + calibration tab
-# ═══════════════════════════════════════════════════════════════════════════
 
 _LABEL_DEFS: list[tuple[str, str]] = [
     ("Fwd Walk",    "WALKING_FORWARD"),
@@ -952,21 +981,13 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Foot Pressure — Slim Live Monitor")
-        # The Calibration tab is the tallest content in the app; use a larger
-        # minimum so none of its buttons ever get clipped on Windows at
-        # 100–150% display scaling.  The panel is also wrapped in a scroll
-        # area so going below this is still usable (just with a scrollbar).
+        self.setWindowTitle("Foot Pressure — Live Monitor")
         self.setMinimumSize(1200, 820)
         self.resize(1320, 900)
         self.setStyleSheet(DARK_STYLE)
 
-        # Flipped to True by _on_socket_data on first synced bilateral frame,
-        # and pushed into the CalibrationPanel so its Start buttons are only
-        # effective when real data is flowing.
         self._live_bilateral_ok: bool = False
 
-        # TCP + CSV state
         self._thread_l: Optional[SocketThread] = None
         self._thread_r: Optional[SocketThread] = None
         self._csv_labeled_f = None
@@ -977,33 +998,27 @@ class MainWindow(QMainWindow):
         self._csv_raw_path = ""
 
         self._data_n = 0
-        # 攒够这么多行再 flush 一次，避免每帧都 IO。
-        # 10Hz 下 20 行差不多 2 秒，崩了最多丢 2 秒录制。
         self._csv_flush_every = 20
         self._csv_since_flush = 0
         self.current_label = "UNKNOWN"
         self.recognizer = OnlineRecognizer()
 
-        # UI 节流：识别器每帧都跑（状态机需要），但 UI 文字没必要 10–20Hz 刷。
-        # 至少隔这么久才允许刷新一次 HUD / 通道读数 / 流元信息。
-        self._ui_refresh_min_interval = 0.20  # 秒，也就是 ~5 Hz
+        self._ui_refresh_min_interval = 0.20
         self._last_ui_refresh_t = 0.0
-        self._last_hud_state = None  # 状态真的变了就立刻刷，不等节流
+        self._last_hud_state = None
 
-        # Latest synced frame for each foot
-        self._last_left: Optional[FootFour] = None
-        self._last_right: Optional[FootFour] = None
+        self._last_left: Optional[FootThree] = None
+        self._last_right: Optional[FootThree] = None
 
-        # Bilateral pairing buffers: (pc_mono_s, ts_mcu, toe, forefoot, heel, knee)
         self.left_buffer: deque = deque(maxlen=200)
         self.right_buffer: deque = deque(maxlen=200)
 
         self._conn_l = "disconnected"
         self._conn_r = "disconnected"
+        self._session_mode: str = "idle"
 
         self._build_ui()
 
-    # ── UI construction ─────────────────────────────────────────
     def _build_ui(self):
         root = QWidget()
         root.setStyleSheet("background-color:#0a0a1a;")
@@ -1018,11 +1033,18 @@ class MainWindow(QMainWindow):
         sep.setStyleSheet("background:#1c1c3a;")
         vbox.addWidget(sep)
 
+        self.mode_banner = QLabel(
+            "Mode: idle — choose <b>Listen</b>, <b>Inference</b>, or <b>Data capture</b>, then Start."
+        )
+        self.mode_banner.setTextFormat(Qt.RichText)
+        self.mode_banner.setWordWrap(True)
+        self.mode_banner.setStyleSheet(
+            "color:#8a8ab8; font-size:12px; padding:4px 2px; background:transparent;"
+        )
+        vbox.addWidget(self.mode_banner)
+
         vbox.addWidget(self._build_live_panel())
-        # Cascade HUD: natural size, doesn't need to grow.
         vbox.addWidget(self._build_cascade_panel(), stretch=0)
-        # Tabs (Data capture / Inference / Calibration) get the remaining
-        # vertical space so Calibration always has room for every control.
         vbox.addWidget(self._build_tabs(), stretch=1)
 
         self.statusBar().showMessage("Ready — set IP / ports, then Start.")
@@ -1075,46 +1097,50 @@ class MainWindow(QMainWindow):
         return top
 
     def _build_live_panel(self) -> QFrame:
-        """Live ADC readout for all 8 channels (updated only on synced frames)."""
-        box = QFrame(); box.setObjectName("card")
+        box = QFrame()
+        box.setObjectName("card")
+        self.live_sensor_card = box
         lay = QVBoxLayout(box)
         lay.setContentsMargins(14, 10, 14, 10)
         lay.setSpacing(6)
 
-        head = QLabel("Live sensor stream (raw ADC, updated on bilateral sync)")
+        head = QLabel(
+            "Live sensors (bilateral) — top row = LEFT foot, bottom row = RIGHT foot | "
+            "forefoot/heel heatmap + knee (raw 0–4095 when synced)"
+        )
         head.setStyleSheet("color:#9090b0; font-size:11px; font-weight:bold;")
-        lay.addWidget(head)
 
-        grid = QGridLayout(); grid.setHorizontalSpacing(10); grid.setVerticalSpacing(2)
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(12)
+        grid.setVerticalSpacing(6)
 
         left_tag = QLabel("LEFT")
         left_tag.setStyleSheet("color:#ff6b6b; font-size:12px; font-weight:bold;")
-        grid.addWidget(left_tag, 0, 0, Qt.AlignCenter)
-        self.ch_l_toe      = ChannelReadout("Toe",      "#ffd93d")
-        self.ch_l_forefoot = ChannelReadout("Forefoot", "#ff6b6b")
-        self.ch_l_heel     = ChannelReadout("Heel",     "#4ecdc4")
-        self.ch_l_knee     = ChannelReadout("Knee",     "#a78bfa", is_knee=True)
-        grid.addWidget(self.ch_l_toe,      0, 1)
-        grid.addWidget(self.ch_l_forefoot, 0, 2)
-        grid.addWidget(self.ch_l_heel,     0, 3)
-        grid.addWidget(self.ch_l_knee,     0, 4)
+        grid.addWidget(left_tag, 0, 0, Qt.AlignTop)
+        self.heat_l = ForeHeelHeatmapBlock("#ff6b6b", "#4ecdc4")
+        grid.addWidget(self.heat_l, 0, 1)
+        self.ch_l_knee = ChannelReadout("Knee", "#a78bfa", is_knee=True)
+        grid.addWidget(self.ch_l_knee, 0, 2, Qt.AlignTop)
 
         right_tag = QLabel("RIGHT")
         right_tag.setStyleSheet("color:#ff6b6b; font-size:12px; font-weight:bold;")
-        grid.addWidget(right_tag, 1, 0, Qt.AlignCenter)
-        self.ch_r_toe      = ChannelReadout("Toe",      "#ffd93d")
-        self.ch_r_forefoot = ChannelReadout("Forefoot", "#ff6b6b")
-        self.ch_r_heel     = ChannelReadout("Heel",     "#4ecdc4")
-        self.ch_r_knee     = ChannelReadout("Knee",     "#a78bfa", is_knee=True)
-        grid.addWidget(self.ch_r_toe,      1, 1)
-        grid.addWidget(self.ch_r_forefoot, 1, 2)
-        grid.addWidget(self.ch_r_heel,     1, 3)
-        grid.addWidget(self.ch_r_knee,     1, 4)
+        grid.addWidget(right_tag, 1, 0, Qt.AlignTop)
+        self.heat_r = ForeHeelHeatmapBlock("#ff6b6b", "#4ecdc4")
+        grid.addWidget(self.heat_r, 1, 1)
+        self.ch_r_knee = ChannelReadout("Knee", "#a78bfa", is_knee=True)
+        grid.addWidget(self.ch_r_knee, 1, 2, Qt.AlignTop)
 
-        for col in range(1, 5):
-            grid.setColumnStretch(col, 1)
+        grid.setColumnStretch(0, 0)
+        grid.setColumnStretch(1, 1)
+        grid.setColumnStretch(2, 0)
 
-        lay.addLayout(grid)
+        self.inference_live_block = QWidget()
+        ib_lay = QVBoxLayout(self.inference_live_block)
+        ib_lay.setContentsMargins(0, 0, 0, 0)
+        ib_lay.setSpacing(6)
+        ib_lay.addWidget(head)
+        ib_lay.addLayout(grid)
+        lay.addWidget(self.inference_live_block)
 
         self.stream_meta_lbl = QLabel(
             "Packets: 0  |  Bilateral: no  |  CSV: not recording"
@@ -1125,8 +1151,9 @@ class MainWindow(QMainWindow):
         return box
 
     def _build_cascade_panel(self) -> QFrame:
-        """Shows Layer-1 (knee gate), Layer-2 (motion/static), final RF label + step counters."""
-        box = QFrame(); box.setObjectName("card")
+        box = QFrame()
+        box.setObjectName("card")
+        self.hud_card = box
         lay = QVBoxLayout(box)
         lay.setContentsMargins(16, 12, 16, 12)
         lay.setSpacing(8)
@@ -1138,7 +1165,7 @@ class MainWindow(QMainWindow):
         )
         lay.addWidget(self.state_lbl)
 
-        self.layer1_lbl = QLabel("Layer 1 (knee gate): —")
+        self.layer1_lbl = QLabel("Knee mode: —")
         self.layer1_lbl.setAlignment(Qt.AlignCenter)
         self.layer1_lbl.setStyleSheet(
             "color:#9ad0ff; font-size:13px; font-weight:bold;"
@@ -1172,13 +1199,24 @@ class MainWindow(QMainWindow):
 
     def _build_tabs(self) -> QTabWidget:
         tabs = QTabWidget()
-        # Guarantee a sensible minimum height for whichever tab is selected,
-        # so the Calibration panel's content always has room to render the
-        # Step 1/2 buttons and progress bars without being clipped.
         tabs.setMinimumHeight(360)
         tabs.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
-        # Data-capture tab with label strip
+        listen_tab = QWidget()
+        listen_lay = QVBoxLayout(listen_tab)
+        listen_lay.setContentsMargins(10, 8, 10, 8)
+        listen_hint = QLabel(
+            "<b>Listen</b> — verify TCP and bilateral ADC. Uses the live sensor card "
+            "above only: <b>no</b> activity recognition and <b>no</b> CSV. "
+            "Lowest CPU. Stop before switching to Inference or Data capture."
+        )
+        listen_hint.setTextFormat(Qt.RichText)
+        listen_hint.setWordWrap(True)
+        listen_hint.setStyleSheet("color:#9090b0; font-size:12px;")
+        listen_lay.addWidget(listen_hint)
+        listen_lay.addStretch()
+        tabs.addTab(listen_tab, "Listen")
+
         cap_tab = QWidget()
         cap_lay = QVBoxLayout(cap_tab)
         cap_lay.setContentsMargins(10, 8, 10, 8)
@@ -1192,9 +1230,10 @@ class MainWindow(QMainWindow):
         cap_lay.addWidget(self.capture_label_line)
 
         hint = QLabel(
-            "Select a label, then press Start on the top bar.  This writes both "
-            "labeled and raw CSVs into saving_data/ at 10 Hz bilateral-synced rate."
+            "<b>Data capture</b> — pick a label, then <b>Start</b>. Writes labeled + raw CSV "
+            "into saving_data/ at 10 Hz. <b>Stop</b> before switching to Listen or Inference."
         )
+        hint.setTextFormat(Qt.RichText)
         hint.setWordWrap(True)
         hint.setStyleSheet("color:#707090; font-size:11px;")
         cap_lay.addWidget(hint)
@@ -1210,20 +1249,28 @@ class MainWindow(QMainWindow):
         cap_lay.addLayout(lbl_grid)
         tabs.addTab(cap_tab, "Data capture")
 
-        # Inference tab (just explanatory)
         inf_tab = QWidget()
         inf_lay = QVBoxLayout(inf_tab)
         inf_hint = QLabel(
-            "Inference mode — the cascade HUD above updates on every synced frame.\n"
-            "Starting from this tab streams without writing any CSV."
+            "<b>Inference</b> — activity model + step counts. <b>No CSV.</b> "
+            "Default: STATE + counters in the card above. Optional: full sensors + RF debug."
         )
+        inf_hint.setTextFormat(Qt.RichText)
         inf_hint.setWordWrap(True)
         inf_hint.setStyleSheet("color:#9090b0; font-size:12px;")
         inf_lay.addWidget(inf_hint)
+
+        self.infer_show_extras = QCheckBox(
+            "Show foot heatmaps, packet line, Knee / Layer2 / RF (heavier UI)"
+        )
+        self.infer_show_extras.setChecked(False)
+        self.infer_show_extras.setStyleSheet("color:#c0c0d8; font-size:12px;")
+        self.infer_show_extras.toggled.connect(self._on_inference_display_toggled)
+        inf_lay.addWidget(self.infer_show_extras)
+
         inf_lay.addStretch()
         tabs.addTab(inf_tab, "Inference")
 
-        # Calibration tab
         self.calib_panel = CalibrationPanel()
         self.calib_panel.calibration_saved.connect(self._on_calibration_saved)
         tabs.addTab(self.calib_panel, "Calibration")
@@ -1231,7 +1278,6 @@ class MainWindow(QMainWindow):
         self._mode_tabs = tabs
         return tabs
 
-    # ── helpers ─────────────────────────────────────────────────
     @staticmethod
     def _tiny(text: str) -> QLabel:
         lbl = QLabel(text)
@@ -1242,7 +1288,52 @@ class MainWindow(QMainWindow):
         self.current_label = label
         self.capture_label_line.setText(f"Current Label: {label}")
 
-    # ── start / stop ────────────────────────────────────────────
+    def _streaming(self) -> bool:
+        return self._thread_l is not None
+
+    def _on_inference_display_toggled(self, _checked: bool = False) -> None:
+        if not self._streaming() or self._session_mode != "inference":
+            return
+        self._apply_inference_display_prefs()
+
+    def _lock_mode_tabs_for_session(self) -> None:
+        cur = self._mode_tabs.currentIndex()
+        for i in (TAB_LISTEN, TAB_CAPTURE, TAB_INFERENCE):
+            self._mode_tabs.setTabEnabled(i, i == cur)
+        self._mode_tabs.setTabEnabled(TAB_CALIBRATION, True)
+
+    def _unlock_mode_tabs(self) -> None:
+        for i in range(self._mode_tabs.count()):
+            self._mode_tabs.setTabEnabled(i, True)
+
+    def _apply_full_hud_visibility(self) -> None:
+        self.hud_card.setVisible(True)
+        self.live_sensor_card.setVisible(True)
+        self.inference_live_block.setVisible(True)
+        self.stream_meta_lbl.setVisible(True)
+        self.layer1_lbl.setVisible(True)
+        self.layer2_lbl.setVisible(True)
+        self.rf_lbl.setVisible(True)
+
+    def _apply_inference_display_prefs(self) -> None:
+        self.hud_card.setVisible(True)
+        extras = self.infer_show_extras.isChecked()
+        self.live_sensor_card.setVisible(extras)
+        self.layer1_lbl.setVisible(extras)
+        self.layer2_lbl.setVisible(extras)
+        self.rf_lbl.setVisible(extras)
+
+    def _apply_session_layout_after_start(self) -> None:
+        if self._session_mode == "listen":
+            self.hud_card.setVisible(False)
+            self.live_sensor_card.setVisible(True)
+            self.inference_live_block.setVisible(True)
+            self.stream_meta_lbl.setVisible(True)
+        elif self._session_mode == "inference":
+            self._apply_inference_display_prefs()
+        else:
+            self._apply_full_hud_visibility()
+
     def _start(self):
         host = self.ip_in.text().strip()
         try:
@@ -1252,36 +1343,68 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("Port L / Port R must be integers")
             return
 
-        # CSV only when launched from Data capture tab
+        tab_i = self._mode_tabs.currentIndex()
+        if tab_i == TAB_CALIBRATION:
+            QMessageBox.information(
+                self,
+                "Choose a stream mode",
+                "Start streaming from the **Listen**, **Data capture**, or **Inference** tab.\n\n"
+                "Use **Calibration** while data is already streaming to run the wizard.",
+            )
+            return
+
+        if tab_i == TAB_LISTEN:
+            self._session_mode = "listen"
+        elif tab_i == TAB_CAPTURE:
+            self._session_mode = "capture"
+        else:
+            self._session_mode = "inference"
+
         self._csv_labeled_path = ""
         self._csv_raw_path = ""
         self._csv_labeled_f = self._csv_raw_f = None
         self._csv_writer_labeled = self._csv_writer_raw = None
 
-        if self._mode_tabs.currentIndex() == 0:
-            os.makedirs("saving_data", exist_ok=True)
+        if self._session_mode == "capture":
+            os.makedirs("saving_data/labeled", exist_ok=True)
+            os.makedirs("saving_data/raw", exist_ok=True)
             ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-            self._csv_labeled_path = f"saving_data/sensor_data_dual_labeled_{ts}.csv"
-            self._csv_raw_path = f"saving_data/sensor_data_dual_raw_{ts}.csv"
+            self._csv_labeled_path = f"saving_data/labeled/sensor_data_dual_labeled_{ts}.csv"
+            self._csv_raw_path = f"saving_data/raw/sensor_data_dual_raw_{ts}.csv"
             self._csv_labeled_f = open(self._csv_labeled_path, "w", newline="", encoding="utf-8")
-            self._csv_raw_f     = open(self._csv_raw_path,     "w", newline="", encoding="utf-8")
+            self._csv_raw_f = open(self._csv_raw_path, "w", newline="", encoding="utf-8")
             self._csv_writer_labeled = csv.writer(self._csv_labeled_f)
-            self._csv_writer_raw     = csv.writer(self._csv_raw_f)
-            hdr_8 = [
-                "Timestamp",
-                "L_Toe", "L_Forefoot", "L_Heel", "L_Knee",
-                "R_Toe", "R_Forefoot", "R_Heel", "R_Knee",
+            self._csv_writer_raw = csv.writer(self._csv_raw_f)
+            hdr_6 = [
+                "L_Forefoot", "L_Heel", "L_Knee",
+                "R_Forefoot", "R_Heel", "R_Knee",
             ]
-            self._csv_writer_labeled.writerow([*hdr_8, "Label"])
-            self._csv_writer_raw.writerow(hdr_8)
+            self._csv_writer_labeled.writerow([*hdr_6, "Label"])
+            self._csv_writer_raw.writerow(hdr_6)
+
+        if self._session_mode == "listen":
+            self.mode_banner.setText(
+                "Active: <b>Listen</b> — bilateral ADC above · <b>no</b> CSV · <b>no</b> ML "
+                "(stop, then switch tab to run inference or recording)."
+            )
+        elif self._session_mode == "inference":
+            self.mode_banner.setText(
+                "Active: <b>Inference</b> — STATE + steps · optional sensor/RF via checkbox · "
+                "<b>no</b> CSV."
+            )
+        else:
+            self.mode_banner.setText(
+                "Active: <b>Data capture</b> — writing labeled + raw CSV · full HUD + ML."
+            )
+
+        if self._session_mode in ("inference", "capture"):
+            self.recognizer = OnlineRecognizer()
 
         self._last_left = None
         self._last_right = None
         self._data_n = 0
         self.left_buffer.clear()
         self.right_buffer.clear()
-        # Calibration panel should only allow progress advance once real
-        # bilateral packets arrive — reset the flag on every Start.
         self._live_bilateral_ok = False
         if getattr(self, "calib_panel", None) is not None:
             self.calib_panel.set_live_state(False)
@@ -1296,21 +1419,23 @@ class MainWindow(QMainWindow):
         self._thread_l.start()
         self._thread_r.start()
 
+        self._lock_mode_tabs_for_session()
+        self._apply_session_layout_after_start()
+
         self.start_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
         self.ip_in.setEnabled(False)
         self.port_left_in.setEnabled(False)
         self.port_right_in.setEnabled(False)
 
-        if self._csv_writer_labeled is not None:
+        if self._session_mode == "capture":
             self.statusBar().showMessage(
-                f"Recording labeled: {self._csv_labeled_path}  "
-                f"raw: {self._csv_raw_path}"
+                f"Recording: {self._csv_labeled_path}  |  raw: {self._csv_raw_path}"
             )
+        elif self._session_mode == "inference":
+            self.statusBar().showMessage("Inference — ML on, no CSV.")
         else:
-            self.statusBar().showMessage(
-                "Streaming (Inference) — no CSV; switch to Data capture to record."
-            )
+            self.statusBar().showMessage("Listen — live data only, ML off, no CSV.")
 
     def _stop(self):
         for th in (self._thread_l, self._thread_r):
@@ -1340,32 +1465,29 @@ class MainWindow(QMainWindow):
         self._live_bilateral_ok = False
         if getattr(self, "calib_panel", None) is not None:
             self.calib_panel.set_live_state(False)
-        self.statusBar().showMessage("Stopped listening (both MCUs).")
+        self._unlock_mode_tabs()
+        self._session_mode = "idle"
+        self._apply_full_hud_visibility()
+        self.mode_banner.setText(
+            "Mode: idle — choose <b>Listen</b> (data only), <b>Inference</b> (ML), or "
+            "<b>Data capture</b> (CSV), then Start."
+        )
+        self.statusBar().showMessage("Stopped.")
 
-    # ── socket slots ────────────────────────────────────────────
     def _on_socket_data(
         self,
         side: str,
-        ts_ms: object,
-        toe: float,
         forefoot: float,
         heel: float,
         knee: float,
     ) -> None:
-        """Pair L/R by PC receive time; only synced pairs drive UI + recognizer + CSV."""
-        try:
-            ts_ms_i = int(ts_ms)
-        except (TypeError, ValueError):
-            return
-
         self._data_n += 1
 
         try:
             pc_now = time.monotonic()
-            sample = (pc_now, ts_ms_i, toe, forefoot, heel, knee)
+            sample = (pc_now, forefoot, heel, knee)
             synced = False
-            l4 = r4 = None
-            ts_avg_mcu = 0.0
+            l3 = r3 = None
 
             if side == "L":
                 self.left_buffer.append(sample)
@@ -1377,9 +1499,8 @@ class MainWindow(QMainWindow):
                 if best is not None and best_d <= SYNC_PC_MAX_S:
                     self.left_buffer.pop()
                     _deque_remove_one(self.right_buffer, best)
-                    ts_avg_mcu = (ts_ms_i + best[1]) / 2.0
-                    l4 = (toe, forefoot, heel, knee)
-                    r4 = (best[2], best[3], best[4], best[5])
+                    l3 = (forefoot, heel, knee)
+                    r3 = (best[1], best[2], best[3])
                     synced = True
             else:
                 self.right_buffer.append(sample)
@@ -1391,28 +1512,26 @@ class MainWindow(QMainWindow):
                 if best is not None and best_d <= SYNC_PC_MAX_S:
                     self.right_buffer.pop()
                     _deque_remove_one(self.left_buffer, best)
-                    ts_avg_mcu = (best[1] + ts_ms_i) / 2.0
-                    l4 = (best[2], best[3], best[4], best[5])
-                    r4 = (toe, forefoot, heel, knee)
+                    l3 = (best[1], best[2], best[3])
+                    r3 = (forefoot, heel, knee)
                     synced = True
 
-            if synced and l4 is not None and r4 is not None:
-                self._last_left = l4
-                self._last_right = r4
-                # Flip the live flag once — tell the Calibration panel it is
-                # now safe to accept Start Step 1 / Step 2 and that its
-                # progress bar will advance against real data.
+            if synced and l3 is not None and r3 is not None:
+                self._last_left = l3
+                self._last_right = r3
                 if not self._live_bilateral_ok:
                     self._live_bilateral_ok = True
                     if self.calib_panel is not None:
                         self.calib_panel.set_live_state(True)
-                self._append_csv_synced(ts_avg_mcu, l4, r4)
-                # 标定面板内部有自己的累计/判定，必须每帧喂，不能节流
+                if self._session_mode == "capture":
+                    self._append_csv_synced(l3, r3)
                 if self.calib_panel is not None:
-                    self.calib_panel.feed(l4, r4)
-                # 识别器同样每帧都要跑，状态机 / 防抖计数都靠时间连续
-                hud_out = self._run_recognizer(l4, r4)
-                # 真正刷 UI 的部分做节流：到时间 or 状态变了才更新
+                    self.calib_panel.feed(l3, r3)
+
+                hud_out = None
+                if self._session_mode in ("inference", "capture"):
+                    hud_out = self._run_recognizer(l3, r3)
+
                 now = time.monotonic()
                 state_changed = (
                     hud_out is not None
@@ -1423,10 +1542,13 @@ class MainWindow(QMainWindow):
                     or (now - self._last_ui_refresh_t) >= self._ui_refresh_min_interval
                 ):
                     self._last_ui_refresh_t = now
-                    self._update_live_readouts(l4, r4)
+                    if self.live_sensor_card.isVisible():
+                        self._update_live_readouts(l3, r3)
                     if hud_out is not None:
                         self._update_hud(hud_out)
                         self._last_hud_state = hud_out["state"]
+                    elif self._session_mode == "listen":
+                        self._last_hud_state = None
                     self._refresh_stream_meta()
         except Exception as exc:  # noqa: BLE001
             self.statusBar().showMessage(f"data error: {exc}")
@@ -1434,21 +1556,17 @@ class MainWindow(QMainWindow):
 
     def _append_csv_synced(
         self,
-        ts_ms: float,
-        l4: Tuple[float, float, float, float],
-        r4: Tuple[float, float, float, float],
+        l3: Tuple[float, float, float],
+        r3: Tuple[float, float, float],
     ) -> None:
         if self._csv_writer_labeled is None or self._csv_writer_raw is None:
             return
-        ts_str = str(int(round(ts_ms)))
-        row8 = [
-            ts_str,
-            str(l4[0]), str(l4[1]), str(l4[2]), str(l4[3]),
-            str(r4[0]), str(r4[1]), str(r4[2]), str(r4[3]),
+        row6 = [
+            str(l3[0]), str(l3[1]), str(l3[2]),
+            str(r3[0]), str(r3[1]), str(r3[2]),
         ]
-        self._csv_writer_labeled.writerow([*row8, self.current_label])
-        self._csv_writer_raw.writerow(row8)
-        # 每帧 flush 太卡主线程，攒一批一起刷。closeEvent 关文件时也会自动刷。
+        self._csv_writer_labeled.writerow([*row6, self.current_label])
+        self._csv_writer_raw.writerow(row6)
         self._csv_since_flush += 1
         if self._csv_since_flush >= self._csv_flush_every:
             self._csv_since_flush = 0
@@ -1459,43 +1577,41 @@ class MainWindow(QMainWindow):
 
     def _update_live_readouts(
         self,
-        l4: Tuple[float, float, float, float],
-        r4: Tuple[float, float, float, float],
+        l3: Tuple[float, float, float],
+        r3: Tuple[float, float, float],
     ) -> None:
-        self.ch_l_toe.set_raw(l4[0])
-        self.ch_l_forefoot.set_raw(l4[1])
-        self.ch_l_heel.set_raw(l4[2])
-        self.ch_l_knee.set_raw(l4[3])
-        self.ch_r_toe.set_raw(r4[0])
-        self.ch_r_forefoot.set_raw(r4[1])
-        self.ch_r_heel.set_raw(r4[2])
-        self.ch_r_knee.set_raw(r4[3])
+        self.heat_l.set_sensors(l3[0], l3[1])
+        self.heat_r.set_sensors(r3[0], r3[1])
+        self.ch_l_knee.set_raw(l3[2])
+        self.ch_r_knee.set_raw(r3[2])
 
     def _refresh_stream_meta(self):
         bilat = "yes" if (self._last_left and self._last_right) else "no"
-        if self._csv_writer_labeled is None:
-            csv_part = "CSV: not recording"
-        else:
+        sm = self._session_mode if self._streaming() else "idle"
+        if sm == "capture" and self._csv_writer_labeled is not None:
             csv_part = f"CSV: {os.path.basename(self._csv_labeled_path)}"
+        elif sm == "listen":
+            csv_part = "CSV: off"
+        elif sm == "inference":
+            csv_part = "CSV: off"
+        else:
+            csv_part = "CSV: —"
         self.stream_meta_lbl.setText(
-            f"Packets: {self._data_n}  |  Bilateral: {bilat}  |  {csv_part}"
+            f"[{sm}]  Packets: {self._data_n}  |  Bilateral: {bilat}  |  {csv_part}"
         )
 
-    # ── recognizer / HUD ────────────────────────────────────────
-    def _run_recognizer(self, l4_raw, r4_raw):
-        """每帧都要调：喂给识别器并返回它的输出（不碰 UI）。"""
-        l4 = foot_tuple_for_recognizer(l4_raw)
-        r4 = foot_tuple_for_recognizer(r4_raw)
-        if l4 is not None and r4 is not None:
-            return self.recognizer.update_bilateral(l4, r4)
-        if l4 is not None:
-            return self.recognizer.update(*l4)
-        if r4 is not None:
-            return self.recognizer.update(*r4)
+    def _run_recognizer(self, l3_raw, r3_raw):
+        l3 = foot_tuple_for_recognizer(l3_raw)
+        r3 = foot_tuple_for_recognizer(r3_raw)
+        if l3 is not None and r3 is not None:
+            return self.recognizer.update_bilateral(l3, r3)
+        if l3 is not None:
+            return self.recognizer.update_single(*l3)
+        if r3 is not None:
+            return self.recognizer.update_single(*r3)
         return None
 
     def _update_hud(self, out: dict):
-        """只刷 HUD 的五个大 label；被节流调度，不用每帧调。"""
         state = out["state"]
         counters = out["counters"]
         debug = out.get("debug", {})
@@ -1506,13 +1622,10 @@ class MainWindow(QMainWindow):
             f"color:{clr}; font-size:22px; font-weight:bold;"
         )
 
-        l1 = debug.get("layer1_branch", "—")
-        ph = debug.get("knee_gate_phase", "—")
-        min_raw = debug.get("knee_min_raw", "—")
-        th = debug.get("knee_gate_straight_th", "—")
+        km = debug.get("knee_mode", "—")
+        br = debug.get("branch", km)
         self.layer1_lbl.setText(
-            f"Layer 1: {l1}   phase={ph}   "
-            f"min_raw={min_raw}   straight_th<{th}"
+            f"Knee mode: {km}   branch={br}"
         )
 
         l2 = debug.get("layer2_subbranch", "—")
@@ -1539,7 +1652,6 @@ class MainWindow(QMainWindow):
             f"Sit→Stand: {sts_text}"
         )
 
-    # ── connection status ──────────────────────────────────────
     def _on_status(self, msg: str):
         self.statusBar().showMessage(msg)
 
@@ -1560,9 +1672,7 @@ class MainWindow(QMainWindow):
         self._conn_r = state
         self._sync_conn_label()
 
-    # ── calibration hot-reload ─────────────────────────────────
     def _on_calibration_saved(self, json_path: str):
-        """Build a fresh recognizer with the just-saved calibration so it is live instantly."""
         try:
             self.recognizer = OnlineRecognizer(calibration=json_path)
             self.statusBar().showMessage(
@@ -1572,7 +1682,6 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(f"Reload recognizer failed: {exc}")
             traceback.print_exc()
 
-    # ── cleanup ────────────────────────────────────────────────
     def closeEvent(self, event):
         for th in (self._thread_l, self._thread_r):
             if th is not None:
@@ -1587,11 +1696,13 @@ class MainWindow(QMainWindow):
         event.accept()
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-#  ENTRY POINT
-# ═══════════════════════════════════════════════════════════════════════════
-
 def main():
+    _here = os.path.dirname(os.path.abspath(__file__))
+    try:
+        os.chdir(_here)
+    except OSError as exc:
+        print("Warning: could not chdir to script folder:", _here, exc, file=sys.stderr)
+
     app = QApplication(sys.argv)
     app.setFont(QFont("Segoe UI", 10))
 

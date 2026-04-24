@@ -1,0 +1,29 @@
+# Python cache / build
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Notebook / IDE state
+.ipynb_checkpoints/
+.idea/
+.vscode/
+
+# OS-specific junk
+**/__MACOSX/
+**/.DS_Store
+._*
+Thumbs.db
+
+# Local experiment outputs
+confusion_matrices/*.png
+saving_data/rf_exploration_charts/
+saving_data/**/*.zip
+
+# Optional local model artifacts (keep reproducibility via training script)
+*.joblib
